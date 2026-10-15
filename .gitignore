@@ -1,0 +1,18 @@
+# Data, caches and training outputs
+data/
+runs/
+logs/
+
+# Environments
+.venv/
+.conda/
+*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vscode/
+.DS_Store
+.ipynb_checkpoints/

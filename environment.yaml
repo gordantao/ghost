@@ -1,0 +1,15 @@
+# Conda environment for the Longleaf cluster:
+#   conda env create -f environment.yaml && conda activate ghost && pip install -e .
+name: ghost
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch
+  - pytorch-cuda=12.1
+  - numpy
+  - pandas
+  - pytest
+  - pip
