@@ -1,15 +1,17 @@
-# Conda environment for the Longleaf cluster:
+# Conda environment for the Longleaf cluster (CUDA 12.9):
 #   conda env create -f environment.yaml && conda activate ghost && pip install -e .
+# PyTorch no longer ships conda packages, so torch comes from its CUDA 12.9 pip
+# wheels, which bundle their own CUDA runtime; `module load cuda/12.9` in the
+# sbatch scripts only needs a driver that supports 12.9.
 name: ghost
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
 dependencies:
-  - python=3.11
-  - pytorch
-  - pytorch-cuda=12.1
+  - python=3.12
   - numpy
   - pandas
   - pytest
   - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu129
+      - torch==2.13.0+cu129

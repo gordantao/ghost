@@ -17,7 +17,7 @@
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
-module load cuda/12.1
+module load cuda/12.9
 PYTHON="${PYTHON:-$HOME/.conda/envs/ghost/bin/python}"
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
