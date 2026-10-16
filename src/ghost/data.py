@@ -1,6 +1,7 @@
 """Loading the preprocessed cache and splitting it by game."""
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ class PlayData:
     length: torch.Tensor     # [P] valid frames per play
     group: torch.Tensor      # [P, 23] position-group index (see preprocess.GROUP_VOCAB)
     glob: torch.Tensor       # [P, G] play-context features
+    coverage: torch.Tensor   # [P] PFF coverage call (preprocess.COVERAGE_VOCAB); a target, never an input
     nfl_id: np.ndarray       # [P, 22]
     game_id: np.ndarray      # [P]
     play_id: np.ndarray      # [P]
@@ -28,15 +30,22 @@ class PlayData:
             length=torch.from_numpy(arrays['length']),
             group=torch.from_numpy(arrays['group']),
             glob=torch.from_numpy(arrays['glob']),
+            coverage=torch.from_numpy(arrays['coverage']),
             nfl_id=arrays['nfl_id'], game_id=arrays['game_id'], play_id=arrays['play_id'],
             meta=json.loads(Path(path).with_suffix('.json').read_text()),
         )
+
+    def fingerprint(self) -> str:
+        """Hash of the play order, which fold splits are rebuilt from."""
+        h = hashlib.sha256(np.ascontiguousarray(self.game_id, dtype=np.int64).tobytes())
+        h.update(np.ascontiguousarray(self.play_id, dtype=np.int64).tobytes())
+        return h.hexdigest()[:16]
 
     def __len__(self) -> int:
         return len(self.length)
 
     def to(self, device: torch.device) -> 'PlayData':
-        for name in ('dyn', 'length', 'group', 'glob'):
+        for name in ('dyn', 'length', 'group', 'glob', 'coverage'):
             setattr(self, name, getattr(self, name).to(device))
         return self
 
@@ -49,6 +58,7 @@ class PlayData:
             'time_mask': torch.arange(t_max, device=length.device)[None] < length[:, None],
             'group': self.group[idx],
             'glob': self.glob[idx],
+            'coverage': self.coverage[idx],
         }
 
 

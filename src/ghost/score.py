@@ -10,11 +10,18 @@ H for the (play, receiver) is the mean of H_t. Positive H means the real
 defense played r tighter than a typical defense would have given the same
 offensive movement; that extra attention is the receiver's "gravity".
 
+Two ghosts are scored. For H the ghost draws its coverage call from the model's
+prior, so H is total gravity, including any that shows up in the call itself.
+For H_within the ghost runs the defense's actual call, so H_within is gravity
+within the call, and H_call = H - H_within is the part that acts through the
+play call.
+
 Each play is scored only by the model whose fold held it out, so no score
 comes from a model that trained on that play.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -60,19 +67,29 @@ def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
     _, _, held_out = split_indices(data.game_id, ckpt['fold'], ckpt['n_folds'],
                                    ckpt['train_config']['val_frac'], seed)
     torch.manual_seed(seed)
+    coverage_vocab = data.meta['coverage_vocab']
 
     frames = []
     for i in range(0, len(held_out), batch_size):
         idx = held_out[i:i + batch_size]
         batch = data.batch(torch.from_numpy(idx).to(device))
-        result = heliocentricity(model.sample(batch, n_samples), batch, model.cfg.obs_frames)
-        group = data.group[torch.from_numpy(idx).to(device)][:, OFF].cpu().numpy()
-        cols = {k: v.cpu().numpy() for k, v in result.items()}
+        # Same z noise for both ghosts, so H_call reflects the call, not Monte Carlo noise.
+        batch_seed = int(torch.randint(2 ** 62, ()))
+        gen = lambda: torch.Generator(device).manual_seed(batch_seed)  # noqa: E731
+        total = heliocentricity(model.sample(batch, n_samples, generator=gen()), batch, model.cfg.obs_frames)
+        within = heliocentricity(model.sample(batch, n_samples, coverage=batch['coverage'], generator=gen()),
+                                 batch, model.cfg.obs_frames)
+        group = batch['group'][:, OFF].cpu().numpy()
+        cols = {k: v.cpu().numpy() for k, v in total.items()}
+        cols['expected_sep_within'] = within['expected_sep'].cpu().numpy()
+        cols['H_within'] = within['H'].cpu().numpy()
+        cols['H_call'] = cols['H'] - cols['H_within']
         play_rows = pd.DataFrame({
             'game_id': np.repeat(data.game_id[idx], 11),
             'play_id': np.repeat(data.play_id[idx], 11),
             'nfl_id': data.nfl_id[idx][:, OFF].ravel(),
             'group': [GROUP_VOCAB[g] for g in group.ravel()],
+            'coverage': np.repeat([coverage_vocab[c] for c in batch['coverage'].cpu().numpy()], 11),
             **{k: v.ravel() for k, v in cols.items()},
         })
         frames.append(play_rows[np.isin(group.ravel(), RECEIVER_IDS)])
@@ -85,27 +102,61 @@ def aggregate_players(plays: pd.DataFrame, players_csv: Path | None) -> pd.DataF
     stats = plays.groupby('nfl_id').agg(
         group=('group', 'first'), n_plays=('H', 'size'),
         H_mean=('H', 'mean'), H_std=('H', 'std'),
-        expected_sep=('expected_sep', 'mean'), actual_sep=('actual_sep', 'mean'),
+        H_within_mean=('H_within', 'mean'), H_within_std=('H_within', 'std'),
+        H_call_mean=('H_call', 'mean'), H_call_std=('H_call', 'std'),
+        expected_sep=('expected_sep', 'mean'), expected_sep_within=('expected_sep_within', 'mean'),
+        actual_sep=('actual_sep', 'mean'),
     )
-    stats['H_se'] = stats.H_std / np.sqrt(stats.n_plays)
+    for h in ('H', 'H_within', 'H_call'):
+        stats[f'{h}_se'] = stats[f'{h}_std'] / np.sqrt(stats.n_plays)
     if players_csv is not None and players_csv.exists():
         names = pd.read_csv(players_csv, usecols=['nflId', 'displayName']).set_index('nflId').displayName
         stats.insert(0, 'name', names.reindex(stats.index).to_numpy())
     return stats.sort_values('H_mean', ascending=False).reset_index()
 
 
-def score(data_path: Path, runs_dir: Path, out_dir: Path, n_samples: int = 16,
+def check_checkpoints(ckpts: list[Path]) -> tuple[Path, str]:
+    """Every fold must come from one cross-fitting run; return its cache path and fingerprint.
+
+    Folds with different n_folds, seed, val_frac or cache would hold out
+    overlapping or incomplete sets of plays.
+    """
+    metas = []
+    for c in ckpts:
+        ck = torch.load(c, map_location='cpu', weights_only=False)
+        metas.append({'fold': ck['fold'], 'n_folds': ck['n_folds'], 'seed': ck['train_config']['seed'],
+                      'val_frac': ck['train_config']['val_frac'],
+                      'data_path': os.path.normpath(ck['data_path']),
+                      'data_fingerprint': ck['data_fingerprint']})
+    for key in ('n_folds', 'seed', 'val_frac', 'data_path', 'data_fingerprint'):
+        values = {m[key] for m in metas}
+        if len(values) != 1:
+            raise ValueError(f'fold checkpoints disagree on {key}: '
+                             + ', '.join(f'{c.parent.name}={m[key]}' for c, m in zip(ckpts, metas)))
+    n_folds = metas[0]['n_folds']
+    folds = sorted(m['fold'] for m in metas)
+    if folds != list(range(n_folds)):
+        raise ValueError(f'expected one checkpoint for each of folds 0..{n_folds - 1}, found {folds}')
+    return Path(metas[0]['data_path']), metas[0]['data_fingerprint']
+
+
+def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
           batch_size: int = 32, players_csv: Path | None = None, device: str = 'auto') -> None:
-    dev = pick_device(device)
-    data = PlayData.load(data_path).to(dev)
     ckpts = sorted(runs_dir.glob('fold*/model.pt'))
     if not ckpts:
         raise FileNotFoundError(f'no fold*/model.pt checkpoints under {runs_dir}')
+    trained_on, fingerprint = check_checkpoints(ckpts)
+    if data_path is None:
+        data_path = trained_on
+    elif data_path.resolve() != trained_on.resolve():
+        raise ValueError(f'--data {data_path} differs from the cache the folds trained on ({trained_on})')
 
-    n_folds = {torch.load(c, map_location='cpu', weights_only=False)['n_folds'] for c in ckpts}
-    if len(n_folds) != 1 or len(ckpts) != next(iter(n_folds)):
-        print(f'warning: found {len(ckpts)} fold checkpoints for n_folds={n_folds}; '
-              'plays in missing folds will not be scored')
+    dev = pick_device(device)
+    data = PlayData.load(data_path)
+    if data.fingerprint() != fingerprint:
+        raise ValueError(f'{data_path} has changed since training (play order differs); '
+                         'scoring would rebuild the wrong held-out splits')
+    data.to(dev)
 
     plays = pd.concat([score_fold(c, data, n_samples, batch_size, dev) for c in ckpts], ignore_index=True)
     out_dir.mkdir(parents=True, exist_ok=True)

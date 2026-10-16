@@ -68,11 +68,17 @@ def train(data_path: Path, out_dir: Path, fold: int | None, n_folds: int,
 
     data = PlayData.load(data_path)
     train_idx, val_idx, held_out = split_indices(data.game_id, fold, n_folds, cfg.val_frac, cfg.seed)
+    fingerprint = data.fingerprint()
     data.to(dev)
     print(f'device={dev} fold={fold} train={len(train_idx)} val={len(val_idx)} held_out={len(held_out)}')
 
     model_cfg = ModelConfig(n_dyn=data.dyn.shape[-1], n_glob=data.glob.shape[-1],
+                            n_coverage=len(data.meta['coverage_vocab']),
                             max_frames=data.meta['max_frames'], **model_overrides)
+    shortest = int(data.length.min())
+    if model_cfg.obs_frames >= shortest:
+        raise ValueError(f'obs_frames={model_cfg.obs_frames} leaves nothing to predict on plays '
+                         f'with {shortest} frames; use a smaller value or a larger --min-frames')
     model = GhostDefense(model_cfg).to(dev)
     print(f'parameters: {sum(p.numel() for p in model.parameters()):,}')
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -115,6 +121,7 @@ def train(data_path: Path, out_dir: Path, fold: int | None, n_folds: int,
                     'model_config': asdict(model_cfg), 'train_config': asdict(cfg),
                     'state_dict': model.state_dict(), 'epoch': epoch,
                     'fold': fold, 'n_folds': n_folds, 'data_path': str(data_path),
+                    'data_fingerprint': fingerprint,
                 }, ckpt_path)
     print(f'best val loss {best:.4g}; saved {ckpt_path}')
     return ckpt_path

@@ -7,9 +7,16 @@ its samples describe how a typical defense reacts to the offense's actual
 movement.
 
 Tokens are (frame, entity) pairs. Each block attends over time within an
-entity, then over entities within a frame. The prior sees only the masked
-input; the posterior (training only) also sees the true defense, and its
-latent is a single per-play vector shared by all defenders.
+entity, then over entities within a frame.
+
+The latent has two parts: the defense's coverage call c (one of
+preprocess.COVERAGE_VOCAB) and a continuous per-play vector z for everything
+else. The prior sees only the masked input and gives p(c | context) and
+p(z | context, c). In training c is observed (PFF's label), so the decoder is
+teacher-forced with it and the prior's classifier is trained by cross-entropy;
+the posterior q(z | context, true defense, c) is used only in training. At
+sampling time c is drawn from the prior unless a call is given explicitly, so
+the real call never reaches the ghost by default.
 """
 from __future__ import annotations
 
@@ -17,6 +24,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .preprocess import DEF, GROUP_VOCAB, SIDE_DEFENSE, SIDES
 
@@ -29,6 +37,7 @@ FEATURE_SCALE = (POS_SCALE, POS_SCALE, VEL_SCALE, VEL_SCALE, VEL_SCALE, 1.0, 1.0
 class ModelConfig:
     n_dyn: int
     n_glob: int
+    n_coverage: int
     max_frames: int
     obs_frames: int = 1
     d_model: int = 128
@@ -38,6 +47,11 @@ class ModelConfig:
     n_dec_layers: int = 2
     d_latent: int = 32
     dropout: float = 0.1
+
+    def __post_init__(self):
+        # obs_frames=0 would anchor predictions on real defense from the last frame.
+        if not 1 <= self.obs_frames < self.max_frames:
+            raise ValueError(f'obs_frames must be in [1, max_frames={self.max_frames}), got {self.obs_frames}')
 
 
 class FactorizedBlock(nn.Module):
@@ -86,8 +100,10 @@ class GhostDefense(nn.Module):
         self.post_encoder = blocks(cfg.n_post_layers)
         self.decoder = blocks(cfg.n_dec_layers)
 
-        self.prior_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2 * cfg.d_latent))
-        self.post_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 2 * cfg.d_latent))
+        self.coverage_emb = nn.Embedding(cfg.n_coverage, d)
+        self.coverage_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, cfg.n_coverage))
+        self.prior_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 2 * cfg.d_latent))
+        self.post_head = nn.Sequential(nn.Linear(3 * d, d), nn.GELU(), nn.Linear(d, 2 * cfg.d_latent))
         self.latent_in = nn.Linear(cfg.d_latent, d)
         self.out = nn.Linear(d, 2)
 
@@ -120,42 +136,71 @@ class GhostDefense(nn.Module):
         return (h * w).sum((1, 2)) / (w.sum((1, 2)) * h.shape[2])
 
     def encode(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Context tokens and prior parameters, from defense-masked input only."""
-        time_pad = ~batch['time_mask']
-        h = self.run(self.encoder, self.embed(batch, hide_defense=True), time_pad)
-        mu, logvar = self.prior_head(self.pool(h, batch['time_mask'])).chunk(2, dim=-1)
-        return h, mu, logvar
+        """Context tokens, pooled context and coverage-call logits, from defense-masked input only.
 
-    def posterior(self, batch: dict, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        time_pad = ~batch['time_mask']
-        g = self.run(self.post_encoder, self.embed(batch, hide_defense=False), time_pad)
-        ctx = torch.cat([self.pool(h, batch['time_mask']), self.pool(g, batch['time_mask'])], -1)
-        return self.post_head(ctx).chunk(2, dim=-1)
+        The call logits come from a separate pass over only the first `obs_frames`
+        frames. Later offense movement reacts to the coverage (hot routes, sight
+        adjustments, quick throws), so letting p(c | context) see it would let
+        the ghost read the real call back off the offense.
+        """
+        h = self.run(self.encoder, self.embed(batch, hide_defense=True), ~batch['time_mask'])
+        ctx = self.pool(h, batch['time_mask'])
+        n = self.cfg.obs_frames
+        snap = {key: batch[key][:, :n] for key in ('dyn', 'time_mask')}
+        snap.update(group=batch['group'], glob=batch['glob'])
+        h_snap = self.run(self.encoder, self.embed(snap, hide_defense=True), ~snap['time_mask'])
+        return h, ctx, self.coverage_head(self.pool(h_snap, snap['time_mask']))
 
-    def decode(self, h: torch.Tensor, z: torch.Tensor, batch: dict) -> torch.Tensor:
+    def prior(self, ctx: torch.Tensor, coverage: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """p(z | context, c)."""
+        return self.prior_head(torch.cat([ctx, self.coverage_emb(coverage)], -1)).chunk(2, dim=-1)
+
+    def posterior(self, batch: dict, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """q(z | context, true defense, c); training only."""
+        g = self.run(self.post_encoder, self.embed(batch, hide_defense=False), ~batch['time_mask'])
+        post_ctx = torch.cat([ctx, self.pool(g, batch['time_mask']), self.coverage_emb(batch['coverage'])], -1)
+        return self.post_head(post_ctx).chunk(2, dim=-1)
+
+    def decode(self, h: torch.Tensor, z: torch.Tensor, coverage: torch.Tensor, batch: dict) -> torch.Tensor:
         """Defender positions [B, T, 11, 2] in yards, as offsets from the last observed frame."""
-        x = h + self.latent_in(z)[:, None, None]
+        x = h + (self.latent_in(z) + self.coverage_emb(coverage))[:, None, None]
         x = self.run(self.decoder, x, ~batch['time_mask'])
         anchor = batch['dyn'][:, self.cfg.obs_frames - 1, DEF, :2]
         return anchor[:, None] + POS_SCALE * self.out(x[:, :, DEF])
 
     def forward(self, batch: dict) -> dict[str, torch.Tensor]:
-        """Training pass: decode from a posterior sample; return loss terms."""
-        h, mu_p, logvar_p = self.encode(batch)
-        mu_q, logvar_q = self.posterior(batch, h)
+        """Training pass: decode from a posterior sample with the true call; return loss terms."""
+        h, ctx, coverage_logits = self.encode(batch)
+        mu_p, logvar_p = self.prior(ctx, batch['coverage'])
+        mu_q, logvar_q = self.posterior(batch, ctx)
         z = mu_q + torch.randn_like(mu_q) * (0.5 * logvar_q).exp()
-        pred = self.decode(h, z, batch)
-        return {'pred': pred, 'kl': gaussian_kl(mu_q, logvar_q, mu_p, logvar_p)}
+        pred = self.decode(h, z, batch['coverage'], batch)
+        return {'pred': pred, 'kl': gaussian_kl(mu_q, logvar_q, mu_p, logvar_p),
+                'coverage_logits': coverage_logits}
 
     @torch.no_grad()
-    def sample(self, batch: dict, k: int) -> torch.Tensor:
-        """K ghost-defense futures from the prior: [B, K, T, 11, 2]."""
-        h, mu, logvar = self.encode(batch)
+    def sample(self, batch: dict, k: int, coverage: torch.Tensor | None = None,
+               generator: torch.Generator | None = None) -> torch.Tensor:
+        """K ghost-defense futures from the prior: [B, K, T, 11, 2].
+
+        By default each sample draws its own call from p(c | context) and never
+        reads batch['coverage']. Pass `coverage` [B] to fix the call instead.
+        The z noise is drawn before the call, so two calls with identically
+        seeded generators share it (common random numbers).
+        """
+        h, ctx, coverage_logits = self.encode(batch)
         B = h.shape[0]
         rep = lambda t: t.repeat_interleave(k, dim=0)  # noqa: E731
-        z = rep(mu) + torch.randn(B * k, mu.shape[-1], device=mu.device) * rep((0.5 * logvar).exp())
+        eps = torch.randn(B * k, self.cfg.d_latent, device=h.device, generator=generator)
+        if coverage is None:
+            c = torch.multinomial(coverage_logits.softmax(-1), k, replacement=True,
+                                  generator=generator).reshape(B * k)
+        else:
+            c = rep(coverage)
+        mu, logvar = self.prior(rep(ctx), c)
+        z = mu + eps * (0.5 * logvar).exp()
         batch_k = {'dyn': rep(batch['dyn']), 'time_mask': rep(batch['time_mask'])}
-        pred = self.decode(rep(h), z, batch_k)
+        pred = self.decode(rep(h), z, c, batch_k)
         return pred.reshape(B, k, *pred.shape[1:])
 
 
@@ -167,16 +212,23 @@ def future_mask(time_mask: torch.Tensor, obs_frames: int) -> torch.Tensor:
 
 def elbo_loss(out: dict, batch: dict, obs_frames: int, beta: float,
               sigma: float = 1.0) -> dict[str, torch.Tensor]:
-    """Negative ELBO per play with a fixed-variance Gaussian likelihood (sigma in yards)."""
+    """Negative ELBO per play with a fixed-variance Gaussian likelihood (sigma in yards).
+
+    The coverage call is observed, so its prior log-likelihood -log p(c | context)
+    enters the bound directly (unweighted by beta).
+    """
     target = batch['dyn'][:, :, DEF, :2]
     mask = future_mask(batch['time_mask'], obs_frames)[:, :, None].float()
     sq_err = ((out['pred'] - target) ** 2).sum(-1)
     recon = 0.5 * (sq_err * mask).sum((1, 2)) / sigma ** 2
+    coverage_nll = F.cross_entropy(out['coverage_logits'], batch['coverage'], reduction='none')
     n = mask.sum() * target.shape[2]
     return {
-        'loss': (recon + beta * out['kl']).mean(),
+        'loss': (recon + beta * out['kl'] + coverage_nll).mean(),
         'recon': recon.mean(),
         'kl': out['kl'].mean(),
+        'coverage_nll': coverage_nll.mean(),
+        'coverage_acc': (out['coverage_logits'].argmax(-1) == batch['coverage']).float().mean(),
         'ade': (sq_err.sqrt() * mask).sum() / n,
     }
 

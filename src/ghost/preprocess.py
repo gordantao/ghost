@@ -41,17 +41,30 @@ GROUP_VOCAB = ['UNK', 'QB', 'RB', 'WR', 'TE', 'OL', 'DL', 'LB', 'DB', 'BALL']
 RECEIVER_GROUPS = ('WR', 'TE', 'RB')
 
 DYN_FEATURES = ['x', 'y', 'vx', 'vy', 'a', 'o_sin', 'o_cos']
-GLOBAL_CATEGORICALS = ['pff_passCoverage', 'pff_passCoverageType', 'dropBackType']
+# The PFF coverage call is a training target (the model's discrete latent), never an
+# input: it is labelled after the play from what the defense did. Rare calls are
+# pooled into 'Other'.
+COVERAGE_VOCAB = ['Cover-0', 'Cover-1', 'Cover-2', 'Cover-3', 'Quarters', 'Cover-6',
+                  '2-Man', 'Red Zone', 'Other']
 SNAP_EVENTS = ('ball_snap', 'autoevent_ballsnap')
+SCRAMBLE_TYPES = ('SCRAMBLE', 'SCRAMBLE_ROLLOUT_LEFT', 'SCRAMBLE_ROLLOUT_RIGHT')
 
 PLAY_COLS = ['gameId', 'playId', 'possessionTeam', 'down', 'yardsToGo',
-             'passResult', *GLOBAL_CATEGORICALS]
+             'passResult', 'dropBackType', 'pff_passCoverage']
 
 
 def load_plays(raw: Path) -> pd.DataFrame:
-    """Dropback pass plays (sacks and scrambles included) with play context."""
+    """Dropback pass plays (sacks included) with play context.
+
+    Scrambles are dropped: once the play breaks down the defense is in
+    scramble-drill rules, not its called coverage. Besides the SCRAMBLE*
+    dropback types, QB runs (passResult 'R') are dropped; the few left after
+    that filter are scrambles labelled DESIGNED_RUN or UNKNOWN.
+    """
     plays = pd.read_csv(raw / 'plays.csv', usecols=PLAY_COLS)
-    return plays[plays.passResult.notna() & plays.dropBackType.notna()].reset_index(drop=True)
+    keep = (plays.passResult.notna() & plays.dropBackType.notna()
+            & ~plays.dropBackType.isin(SCRAMBLE_TYPES) & plays.passResult.ne('R'))
+    return plays[keep].reset_index(drop=True)
 
 
 def standardize(df: pd.DataFrame) -> pd.DataFrame:
@@ -98,10 +111,12 @@ def process_week(path: Path, plays: pd.DataFrame, player_groups: pd.Series,
             .groupby(['gameId', 'playId']).frameId.min().rename('snapFrame'))
     track = track.merge(snap, on=['gameId', 'playId'])
     track['t'] = track.frameId - track.snapFrame
-    track = track[(track.t >= 0) & (track.t < max_frames)]
+    # Keep one pre-snap frame: ball velocity at the snap is differenced from it.
+    track = track[(track.t >= -1) & (track.t < max_frames)]
 
     track = track.sort_values(['gameId', 'playId', 'nflId', 'frameId'])
     track = _ball_velocity(standardize(track))
+    track = track[track.t >= 0]
 
     track['side'] = np.where(track.nflId.isna(), SIDE_BALL,
                              np.where(track.team == track.possessionTeam, SIDE_OFFENSE, SIDE_DEFENSE))
@@ -135,16 +150,18 @@ def process_week(path: Path, plays: pd.DataFrame, player_groups: pd.Series,
 
 
 def encode_globals(plays: pd.DataFrame, yards_to_endzone: np.ndarray) -> tuple[np.ndarray, list[str]]:
-    """Down one-hot, scaled distances, and one-hot play-context categoricals."""
+    """Down one-hot and scaled distances: situation known before the snap."""
     parts = [np.eye(4, dtype=np.float32)[plays.down.clip(1, 4).to_numpy() - 1],
              (plays.yardsToGo.to_numpy(np.float32) / 10.0)[:, None],
              (yards_to_endzone.astype(np.float32) / 100.0)[:, None]]
     names = [f'down_{d}' for d in range(1, 5)] + ['yards_to_go', 'yards_to_endzone']
-    for col in GLOBAL_CATEGORICALS:
-        dummies = pd.get_dummies(plays[col].fillna('UNK'), prefix=col, dtype=np.float32)
-        parts.append(dummies.to_numpy())
-        names += list(dummies.columns)
     return np.concatenate(parts, axis=1), names
+
+
+def encode_coverage(coverage: pd.Series) -> np.ndarray:
+    """PFF coverage call -> index into COVERAGE_VOCAB (missing and rare calls -> 'Other')."""
+    other = COVERAGE_VOCAB.index('Other')
+    return coverage.map({c: i for i, c in enumerate(COVERAGE_VOCAB)}).fillna(other).to_numpy(np.int64)
 
 
 def preprocess(raw: Path, out: Path, max_frames: int = 50, min_frames: int = 10) -> None:
@@ -172,13 +189,14 @@ def preprocess(raw: Path, out: Path, max_frames: int = 50, min_frames: int = 10)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
-        out, dyn=dyn, length=length, glob=glob,
+        out, dyn=dyn, length=length, glob=glob, coverage=encode_coverage(play_ctx.pff_passCoverage),
         group=np.array([r['group'] for r in records], dtype=np.int64),
         nfl_id=np.stack([r['nfl_id'] for r in records]),
         game_id=keys.gameId.to_numpy(), play_id=keys.playId.to_numpy(),
     )
     out.with_suffix('.json').write_text(json.dumps({
         'dyn_features': DYN_FEATURES, 'global_features': glob_names,
-        'group_vocab': GROUP_VOCAB, 'max_frames': max_frames, 'n_plays': n,
+        'group_vocab': GROUP_VOCAB, 'coverage_vocab': COVERAGE_VOCAB,
+        'max_frames': max_frames, 'n_plays': n,
     }, indent=2))
     print(f'Saved {n} plays to {out}')

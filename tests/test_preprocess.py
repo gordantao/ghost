@@ -2,7 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ghost.preprocess import BALL, DEF, FIELD_LENGTH, FIELD_WIDTH, OFF, process_week, standardize
+from ghost.preprocess import (BALL, COVERAGE_VOCAB, DEF, FIELD_LENGTH, FIELD_WIDTH, OFF, encode_coverage,
+                              encode_globals, load_plays, process_week, standardize)
 
 
 def test_standardize_left_play_mirrors_right_play():
@@ -44,11 +45,34 @@ def test_process_week_layout(tmp_path):
     assert list(rec['nfl_id'][OFF]) == list(range(100, 111))
     assert list(rec['nfl_id'][DEF]) == list(range(200, 211))
     assert dyn[0, BALL, 0] == pytest.approx(0.0)  # x measured from the ball at the snap
-    # Left play: the ball moving toward smaller raw x is moving toward +x after flipping.
-    assert dyn[1:, BALL, 2] == pytest.approx(10.0)
+    # Left play: the ball moving toward smaller raw x is moving toward +x after flipping,
+    # including at the snap, whose velocity comes from the pre-snap frame.
+    assert dyn[:, BALL, 2] == pytest.approx(10.0)
     assert np.isfinite(dyn).all()
 
 
 def test_process_week_drops_incomplete_plays(tmp_path):
     path, plays = _synthetic_week(tmp_path, drop_player=True)
     assert process_week(path, plays, pd.Series(dtype=str), max_frames=50, min_frames=5) == []
+
+
+def test_load_plays_drops_scrambles(tmp_path):
+    plays = pd.DataFrame({
+        'gameId': 1, 'playId': range(8), 'possessionTeam': 'AAA', 'down': 1, 'yardsToGo': 10,
+        'passResult': ['C', 'R', 'I', 'S', None, 'C', 'R', 'I'],
+        'dropBackType': ['TRADITIONAL', 'SCRAMBLE', 'SCRAMBLE_ROLLOUT_LEFT', 'DESIGNED_ROLLOUT_RIGHT',
+                         'TRADITIONAL', 'SCRAMBLE_ROLLOUT_RIGHT', 'DESIGNED_RUN', None],
+        'pff_passCoverage': 'Cover-3',
+    })
+    plays.to_csv(tmp_path / 'plays.csv', index=False)
+    kept = load_plays(tmp_path)
+    assert list(kept.playId) == [0, 3]
+    _, names = encode_globals(kept, np.zeros(len(kept)))
+    assert not any(n.startswith('dropBackType') for n in names)
+
+
+def test_encode_coverage_pools_rare_and_missing_calls():
+    calls = pd.Series(['Cover-3', 'Bracket', None, '2-Man'])
+    other = COVERAGE_VOCAB.index('Other')
+    assert list(encode_coverage(calls)) == [COVERAGE_VOCAB.index('Cover-3'), other, other,
+                                            COVERAGE_VOCAB.index('2-Man')]

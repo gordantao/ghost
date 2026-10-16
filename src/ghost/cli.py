@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--max-frames', type=int, default=50, help='frames kept after the snap')
     p.add_argument('--min-frames', type=int, default=10)
 
-    model_required = ('n_dyn', 'n_glob', 'max_frames')
+    model_required = ('n_dyn', 'n_glob', 'n_coverage', 'max_frames')
     p = sub.add_parser('train', help='train one fold (or all data with --fold all)')
     p.add_argument('--data', type=Path, default=DEFAULT_DATA)
     p.add_argument('--runs', type=Path, default=DEFAULT_RUNS)
@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> None:
     add_dataclass_args(p, TrainConfig)
 
     p = sub.add_parser('score', help='heliocentricity from cross-fitted fold models')
-    p.add_argument('--data', type=Path, default=DEFAULT_DATA)
+    p.add_argument('--data', type=Path, default=None, help='default: the cache the folds trained on')
     p.add_argument('--runs', type=Path, default=DEFAULT_RUNS)
     p.add_argument('--out', type=Path, default=None, help='default: <runs>/scores')
     p.add_argument('--samples', type=int, default=16)
