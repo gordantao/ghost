@@ -58,17 +58,36 @@ def test_process_week_drops_incomplete_plays(tmp_path):
 
 def test_load_plays_drops_scrambles(tmp_path):
     plays = pd.DataFrame({
-        'gameId': 1, 'playId': range(8), 'possessionTeam': 'AAA', 'down': 1, 'yardsToGo': 10,
+        'gameId': 1, 'playId': range(8), 'possessionTeam': 'AAA', 'quarter': 1, 'gameClock': '15:00',
+        'down': 1, 'yardsToGo': 10, 'preSnapHomeScore': 0, 'preSnapVisitorScore': 0,
         'passResult': ['C', 'R', 'I', 'S', None, 'C', 'R', 'I'],
         'dropBackType': ['TRADITIONAL', 'SCRAMBLE', 'SCRAMBLE_ROLLOUT_LEFT', 'DESIGNED_ROLLOUT_RIGHT',
                          'TRADITIONAL', 'SCRAMBLE_ROLLOUT_RIGHT', 'DESIGNED_RUN', None],
         'pff_passCoverage': 'Cover-3',
     })
     plays.to_csv(tmp_path / 'plays.csv', index=False)
+    pd.DataFrame({'gameId': [1], 'homeTeamAbbr': ['AAA']}).to_csv(tmp_path / 'games.csv', index=False)
     kept = load_plays(tmp_path)
     assert list(kept.playId) == [0, 3]
     _, names = encode_globals(kept, np.zeros(len(kept)))
     assert not any(n.startswith('dropBackType') for n in names)
+
+
+def test_globals_put_score_in_offense_frame(tmp_path):
+    plays = pd.DataFrame({
+        'gameId': [1, 1], 'playId': [0, 1], 'possessionTeam': ['AAA', 'BBB'], 'quarter': [2, 5],
+        'gameClock': ['01:30', '10:00'], 'down': 3, 'yardsToGo': 5,
+        'preSnapHomeScore': 14, 'preSnapVisitorScore': 7,
+        'passResult': 'C', 'dropBackType': 'TRADITIONAL', 'pff_passCoverage': 'Cover-3',
+    })
+    plays.to_csv(tmp_path / 'plays.csv', index=False)
+    pd.DataFrame({'gameId': [1], 'homeTeamAbbr': ['AAA']}).to_csv(tmp_path / 'games.csv', index=False)
+    glob, names = encode_globals(load_plays(tmp_path), np.zeros(2))
+    col = {n: glob[:, i] for i, n in enumerate(names)}
+    np.testing.assert_allclose(col['offense_score'] * 28, [14, 7])  # AAA is home, BBB visits
+    np.testing.assert_allclose(col['defense_score'] * 28, [7, 14])
+    np.testing.assert_allclose(col['quarter_clock'] * 900, [90, 600])
+    assert list(col['quarter_2']) == [1, 0] and list(col['quarter_5']) == [0, 1]
 
 
 def test_encode_coverage_pools_rare_and_missing_calls():

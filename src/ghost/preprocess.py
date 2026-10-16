@@ -49,8 +49,9 @@ COVERAGE_VOCAB = ['Cover-0', 'Cover-1', 'Cover-2', 'Cover-3', 'Quarters', 'Cover
 SNAP_EVENTS = ('ball_snap', 'autoevent_ballsnap')
 SCRAMBLE_TYPES = ('SCRAMBLE', 'SCRAMBLE_ROLLOUT_LEFT', 'SCRAMBLE_ROLLOUT_RIGHT')
 
-PLAY_COLS = ['gameId', 'playId', 'possessionTeam', 'down', 'yardsToGo',
-             'passResult', 'dropBackType', 'pff_passCoverage']
+PLAY_COLS = ['gameId', 'playId', 'possessionTeam', 'quarter', 'gameClock', 'down', 'yardsToGo',
+             'preSnapHomeScore', 'preSnapVisitorScore', 'passResult', 'dropBackType', 'pff_passCoverage']
+N_QUARTERS = 5  # quarter 5 is overtime
 
 
 def load_plays(raw: Path) -> pd.DataFrame:
@@ -64,7 +65,14 @@ def load_plays(raw: Path) -> pd.DataFrame:
     plays = pd.read_csv(raw / 'plays.csv', usecols=PLAY_COLS)
     keep = (plays.passResult.notna() & plays.dropBackType.notna()
             & ~plays.dropBackType.isin(SCRAMBLE_TYPES) & plays.passResult.ne('R'))
-    return plays[keep].reset_index(drop=True)
+    plays = plays[keep].reset_index(drop=True)
+
+    # The score is stored home/visitor; the model's frame is the offense.
+    games = pd.read_csv(raw / 'games.csv', usecols=['gameId', 'homeTeamAbbr'])
+    home = plays.merge(games, on='gameId', how='left').homeTeamAbbr.eq(plays.possessionTeam).to_numpy()
+    plays['offenseScore'] = np.where(home, plays.preSnapHomeScore, plays.preSnapVisitorScore)
+    plays['defenseScore'] = np.where(home, plays.preSnapVisitorScore, plays.preSnapHomeScore)
+    return plays
 
 
 def standardize(df: pd.DataFrame) -> pd.DataFrame:
@@ -150,11 +158,18 @@ def process_week(path: Path, plays: pd.DataFrame, player_groups: pd.Series,
 
 
 def encode_globals(plays: pd.DataFrame, yards_to_endzone: np.ndarray) -> tuple[np.ndarray, list[str]]:
-    """Down one-hot and scaled distances: situation known before the snap."""
+    """Down and quarter one-hots, scaled distances, clock and score: situation known before the snap."""
+    mins, secs = plays.gameClock.str.split(':', expand=True).astype(np.float32).to_numpy().T
     parts = [np.eye(4, dtype=np.float32)[plays.down.clip(1, 4).to_numpy() - 1],
              (plays.yardsToGo.to_numpy(np.float32) / 10.0)[:, None],
-             (yards_to_endzone.astype(np.float32) / 100.0)[:, None]]
-    names = [f'down_{d}' for d in range(1, 5)] + ['yards_to_go', 'yards_to_endzone']
+             (yards_to_endzone.astype(np.float32) / 100.0)[:, None],
+             np.eye(N_QUARTERS, dtype=np.float32)[plays.quarter.clip(1, N_QUARTERS).to_numpy() - 1],
+             ((mins * 60 + secs) / 900.0)[:, None],
+             (plays.offenseScore.to_numpy(np.float32) / 28.0)[:, None],
+             (plays.defenseScore.to_numpy(np.float32) / 28.0)[:, None]]
+    names = ([f'down_{d}' for d in range(1, 5)] + ['yards_to_go', 'yards_to_endzone']
+             + [f'quarter_{q}' for q in range(1, N_QUARTERS + 1)]
+             + ['quarter_clock', 'offense_score', 'defense_score'])
     return np.concatenate(parts, axis=1), names
 
 
