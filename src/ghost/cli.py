@@ -31,9 +31,11 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest='command', required=True)
 
     p = sub.add_parser('preprocess', help='raw tracking CSVs -> array cache')
-    p.add_argument('--raw', type=Path, default=DEFAULT_RAW)
+    p.add_argument('--raw', type=Path, action='append', default=None,
+                   help=f'raw BDB directory; repeat to combine releases (default: {DEFAULT_RAW})')
     p.add_argument('--out', type=Path, default=DEFAULT_DATA)
-    p.add_argument('--max-frames', type=int, default=50, help='frames kept after the snap')
+    p.add_argument('--max-frames', type=int, default=70,
+                   help='longest snap-to-throw window kept; plays that throw later are dropped')
     p.add_argument('--min-frames', type=int, default=10)
 
     model_required = ('n_dyn', 'n_glob', 'n_coverage', 'max_frames')
@@ -71,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == 'preprocess':
         from .preprocess import preprocess
-        preprocess(args.raw, args.out, args.max_frames, args.min_frames)
+        preprocess(args.raw or [DEFAULT_RAW], args.out, args.max_frames, args.min_frames)
     elif args.command == 'train':
         from .train import train
         fold = None if args.fold == 'all' else int(args.fold)
