@@ -1,4 +1,4 @@
-"""Command line entry point: `ghost preprocess | train | score`."""
+"""Command line entry point: `ghost preprocess | train | score | animate`."""
 from __future__ import annotations
 
 import argparse
@@ -55,6 +55,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--players', type=Path, default=DEFAULT_RAW / 'players.csv')
     p.add_argument('--device', default='auto')
 
+    p = sub.add_parser('animate', help='animate one play with its ghost defense (random by default)')
+    p.add_argument('--runs', type=Path, default=DEFAULT_RUNS)
+    p.add_argument('--play-id', type=int, default=None, help='default: a random play')
+    p.add_argument('--game-id', type=int, default=None, help='needed when the play id occurs in several games')
+    p.add_argument('--samples', type=int, default=16)
+    p.add_argument('--actual-call', action='store_true',
+                   help="run the ghost with the defense's real coverage call (the H_within ghost)")
+    p.add_argument('--out', type=Path, default=None, help='default: <runs>/animations/<game>_<play>.gif')
+    p.add_argument('--show', action='store_true', help='open a window instead of saving a GIF')
+    p.add_argument('--seed', type=int, default=None, help='fixes the random play and the ghost samples')
+    p.add_argument('--players', type=Path, default=DEFAULT_RAW / 'players.csv')
+    p.add_argument('--device', default='cpu')
+
     args = parser.parse_args(argv)
     if args.command == 'preprocess':
         from .preprocess import preprocess
@@ -70,6 +83,10 @@ def main(argv: list[str] | None = None) -> None:
         from .score import score
         score(args.data, args.runs, args.out or args.runs / 'scores', args.samples,
               args.batch_size, args.players, args.device)
+    elif args.command == 'animate':
+        from .animate import animate
+        animate(args.runs, args.out, args.game_id, args.play_id, args.samples, args.actual_call,
+                args.players, args.seed, args.device, args.show)
 
 
 if __name__ == '__main__':

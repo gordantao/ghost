@@ -10,7 +10,8 @@ requires-python = ">=3.11"
 dependencies = ["numpy", "pandas", "torch"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+viz = ["matplotlib"]
+dev = ["pytest", "matplotlib"]
 
 [project.scripts]
 ghost = "ghost.cli:main"

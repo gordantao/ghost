@@ -20,6 +20,7 @@ ghost preprocess                       # data/raw/bdb2023 -> data/processed/bdb2
 ghost train --fold 0                   # one cross-fitting fold -> runs/default/fold0/{model.pt,metrics.csv}
 ghost train --fold all                 # train on everything (no held-out plays)
 ghost score                            # needs every fold -> runs/default/scores/*.csv
+ghost animate [--play-id N --game-id G] [--actual-call]   # random play by default -> runs/default/animations/*.gif
 ```
 
 Every `ModelConfig` and `TrainConfig` field is also a CLI flag (`--d-model`, `--obs-frames`, `--epochs`, ...). Use `--runs runs/<name>` to keep experiments apart.

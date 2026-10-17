@@ -10,6 +10,7 @@ dependencies:
   - python=3.12
   - numpy
   - pandas
+  - matplotlib
   - pytest
   - pip
   - pip:
