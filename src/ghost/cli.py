@@ -11,6 +11,7 @@ from .train import TrainConfig
 DEFAULT_RAW = Path('data/raw/bdb2023')
 DEFAULT_DATA = Path('data/processed/bdb2023.npz')
 DEFAULT_RUNS = Path('runs/default')
+DEFAULT_PLAYERS = [Path('data/raw/bdb2023/players.csv'), Path('data/raw/bdb2025/players.csv')]
 
 
 def add_dataclass_args(parser: argparse.ArgumentParser, cls, skip=()) -> None:
@@ -54,7 +55,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--out', type=Path, default=None, help='default: <runs>/scores')
     p.add_argument('--samples', type=int, default=16)
     p.add_argument('--batch-size', type=int, default=32)
-    p.add_argument('--players', type=Path, default=DEFAULT_RAW / 'players.csv')
+    p.add_argument('--players', type=Path, action='append', default=None,
+                   help='players.csv for names; repeatable (default: every release in data/raw)')
     p.add_argument('--device', default='auto')
 
     p = sub.add_parser('animate', help='animate one play with its ghost defense (random by default)')
@@ -67,7 +69,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--out', type=Path, default=None, help='default: <runs>/animations/<game>_<play>.gif')
     p.add_argument('--show', action='store_true', help='open a window instead of saving a GIF')
     p.add_argument('--seed', type=int, default=None, help='fixes the random play and the ghost samples')
-    p.add_argument('--players', type=Path, default=DEFAULT_RAW / 'players.csv')
+    p.add_argument('--players', type=Path, action='append', default=None,
+                   help='players.csv for names; repeatable (default: every release in data/raw)')
     p.add_argument('--device', default='cpu')
 
     args = parser.parse_args(argv)
@@ -84,11 +87,11 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == 'score':
         from .score import score
         score(args.data, args.runs, args.out or args.runs / 'scores', args.samples,
-              args.batch_size, args.players, args.device)
+              args.batch_size, args.players or DEFAULT_PLAYERS, args.device)
     elif args.command == 'animate':
         from .animate import animate
         animate(args.runs, args.out, args.game_id, args.play_id, args.samples, args.actual_call,
-                args.players, args.seed, args.device, args.show)
+                args.players or DEFAULT_PLAYERS, args.seed, args.device, args.show)
 
 
 if __name__ == '__main__':

@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from ghost.preprocess import DEF
-from ghost.score import aggregate_players, check_checkpoints, heliocentricity
+from ghost.score import aggregate_players, check_checkpoints, heliocentricity, player_names
 
 
 def test_h_is_zero_when_ghosts_match_reality(batch):
@@ -62,3 +62,11 @@ def test_aggregate_players_splits_total_and_within_call():
     stats = aggregate_players(plays, None).set_index('nfl_id')
     assert stats.loc[1, 'H_mean'] == 2.0 and stats.loc[1, 'H_within_mean'] == 1.0
     assert stats.loc[1, 'H_call_mean'] == 1.0 and stats.loc[1, 'n_plays'] == 2
+
+
+def test_player_names_merge_seasons_and_skip_missing_files(tmp_path):
+    pd.DataFrame({'nflId': [1, 2], 'displayName': ['A', 'B']}).to_csv(tmp_path / 'a.csv', index=False)
+    pd.DataFrame({'nflId': [2, 3], 'displayName': ['B', 'C']}).to_csv(tmp_path / 'b.csv', index=False)
+    names = player_names([tmp_path / 'a.csv', tmp_path / 'b.csv', tmp_path / 'missing.csv'])
+    assert names.to_dict() == {1: 'A', 2: 'B', 3: 'C'}
+    assert player_names(None).empty
