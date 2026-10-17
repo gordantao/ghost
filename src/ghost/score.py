@@ -98,7 +98,15 @@ def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
     return out
 
 
-def aggregate_players(plays: pd.DataFrame, players_csv: Path | None) -> pd.DataFrame:
+def player_names(players_csvs: list[Path] | None) -> pd.Series:
+    """nflId -> display name from every players.csv that exists (seasons can each add players)."""
+    tables = [pd.read_csv(p, usecols=['nflId', 'displayName']) for p in players_csvs or [] if p.exists()]
+    if not tables:
+        return pd.Series(dtype=str)
+    return pd.concat(tables).drop_duplicates('nflId').set_index('nflId').displayName
+
+
+def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None) -> pd.DataFrame:
     stats = plays.groupby('nfl_id').agg(
         group=('group', 'first'), n_plays=('H', 'size'),
         H_mean=('H', 'mean'), H_std=('H', 'std'),
@@ -109,8 +117,8 @@ def aggregate_players(plays: pd.DataFrame, players_csv: Path | None) -> pd.DataF
     )
     for h in ('H', 'H_within', 'H_call'):
         stats[f'{h}_se'] = stats[f'{h}_std'] / np.sqrt(stats.n_plays)
-    if players_csv is not None and players_csv.exists():
-        names = pd.read_csv(players_csv, usecols=['nflId', 'displayName']).set_index('nflId').displayName
+    names = player_names(players_csvs)
+    if len(names):
         stats.insert(0, 'name', names.reindex(stats.index).to_numpy())
     return stats.sort_values('H_mean', ascending=False).reset_index()
 
@@ -141,7 +149,7 @@ def check_checkpoints(ckpts: list[Path]) -> tuple[Path, str]:
 
 
 def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
-          batch_size: int = 32, players_csv: Path | None = None, device: str = 'auto') -> None:
+          batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto') -> None:
     ckpts = sorted(runs_dir.glob('fold*/model.pt'))
     if not ckpts:
         raise FileNotFoundError(f'no fold*/model.pt checkpoints under {runs_dir}')
@@ -161,5 +169,5 @@ def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int 
     plays = pd.concat([score_fold(c, data, n_samples, batch_size, dev) for c in ckpts], ignore_index=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     plays.to_csv(out_dir / 'play_receiver_scores.csv', index=False)
-    aggregate_players(plays, players_csv).to_csv(out_dir / 'player_scores.csv', index=False)
+    aggregate_players(plays, players_csvs).to_csv(out_dir / 'player_scores.csv', index=False)
     print(f'scored {plays.play_id.size} play-receiver pairs from {len(ckpts)} folds -> {out_dir}')

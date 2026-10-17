@@ -16,7 +16,7 @@ import torch
 
 from .data import PlayData, split_indices
 from .preprocess import BALL, DEF, FIELD_WIDTH, FPS, GROUP_VOCAB, OFF, RECEIVER_GROUPS
-from .score import check_checkpoints, heliocentricity
+from .score import check_checkpoints, heliocentricity, player_names
 from .train import load_model, pick_device
 
 # Reference categorical palette, first three slots (validated all-pairs, light surface).
@@ -180,7 +180,7 @@ def render(play: dict, obs_frames: int, title: str, subtitle: str, labels: dict[
 
 
 def animate(runs_dir: Path, out: Path | None, game: int | None = None, play: int | None = None,
-            n_samples: int = 16, actual_call: bool = False, players_csv: Path | None = None,
+            n_samples: int = 16, actual_call: bool = False, players_csvs: list[Path] | None = None,
             seed: int | None = None, device: str = 'cpu', show: bool = False) -> Path | None:
     ckpts = sorted(runs_dir.glob('fold*/model.pt'))
     if not ckpts:
@@ -199,9 +199,7 @@ def animate(runs_dir: Path, out: Path | None, game: int | None = None, play: int
 
     result = ghost_play(model, data, idx, n_samples, actual_call, seed=int(rng.integers(2 ** 62)))
 
-    names = {}
-    if players_csv is not None and players_csv.exists():
-        names = pd.read_csv(players_csv, usecols=['nflId', 'displayName']).set_index('nflId').displayName
+    names = player_names(players_csvs)
     receiver_ids = {GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS}
     labels = {}
     for i in range(OFF.stop):
