@@ -169,11 +169,16 @@ class GhostDefense(nn.Module):
         return anchor[:, None] + POS_SCALE * self.out(x[:, :, DEF])
 
     def forward(self, batch: dict) -> dict[str, torch.Tensor]:
-        """Training pass: decode from a posterior sample with the true call; return loss terms."""
+        """Training pass: decode from a posterior sample with the true call; return loss terms.
+
+        In eval mode the posterior mean is decoded instead of a sample, so
+        validation loss is deterministic and checkpoint selection doesn't
+        chase Monte Carlo noise.
+        """
         h, ctx, coverage_logits = self.encode(batch)
         mu_p, logvar_p = self.prior(ctx, batch['coverage'])
         mu_q, logvar_q = self.posterior(batch, ctx)
-        z = mu_q + torch.randn_like(mu_q) * (0.5 * logvar_q).exp()
+        z = mu_q + torch.randn_like(mu_q) * (0.5 * logvar_q).exp() if self.training else mu_q
         pred = self.decode(h, z, batch['coverage'], batch)
         return {'pred': pred, 'kl': gaussian_kl(mu_q, logvar_q, mu_p, logvar_p),
                 'coverage_logits': coverage_logits}

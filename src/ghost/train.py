@@ -72,12 +72,14 @@ def batches(idx: np.ndarray, size: int, shuffle: bool, rng: np.random.Generator)
 def evaluate(model: GhostDefense, data: PlayData, idx: np.ndarray, cfg: TrainConfig,
              rng: np.random.Generator) -> dict[str, float]:
     model.eval()
+    # Same ghost noise every epoch, so the sample metrics compare across epochs.
+    generator = torch.Generator(device=data.length.device).manual_seed(cfg.seed)
     totals, n = {}, 0
     for b in batches(idx, cfg.batch_size, False, rng):
         batch = data.batch(b.to(data.length.device))
         terms = elbo_loss(model(batch), batch, model.cfg.obs_frames, cfg.beta)
         terms['ade_mean'], terms['ade_min'] = sample_ade(
-            model.sample(batch, cfg.eval_samples), batch, model.cfg.obs_frames)
+            model.sample(batch, cfg.eval_samples, generator=generator), batch, model.cfg.obs_frames)
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + float(value) * len(b)
         n += len(b)

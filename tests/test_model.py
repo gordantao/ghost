@@ -108,3 +108,14 @@ def test_padding_does_not_leak(model, batch):
 def test_obs_frames_must_leave_observed_and_predicted_frames(obs_frames):
     with pytest.raises(ValueError):
         ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, obs_frames=obs_frames)
+
+
+def test_eval_forward_decodes_the_posterior_mean(model, batch):
+    model.eval()
+    with torch.no_grad():
+        a, b = model(batch), model(batch)
+    assert torch.equal(a['pred'], b['pred'])  # validation loss carries no sampling noise
+    model.train()
+    with torch.no_grad():
+        c, d = model(batch), model(batch)
+    assert not torch.equal(c['pred'], d['pred'])  # training still samples z
