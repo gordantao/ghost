@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,7 +18,10 @@ from .model import GhostDefense, ModelConfig, elbo_loss, sample_ade
 class TrainConfig:
     epochs: int = 40
     batch_size: int = 64
-    lr: float = 3e-4
+    lr: float = 3e-4            # peak learning rate
+    lr_schedule: str = 'cosine' # 'cosine' (linear warmup, then cosine decay) or 'constant'
+    warmup_steps: int = 500     # optimizer steps of linear warmup (cosine only)
+    min_lr_frac: float = 0.05   # final learning rate as a fraction of `lr` (cosine only)
     weight_decay: float = 1e-4
     beta: float = 1.0           # final KL weight
     beta_warmup: int = 10       # epochs to anneal KL weight from 0 to beta
@@ -25,6 +29,15 @@ class TrainConfig:
     val_frac: float = 0.1
     eval_samples: int = 6
     seed: int = 0
+
+    def __post_init__(self):
+        # Fail at construction (before the data is loaded), not partway into a cluster job.
+        if self.lr_schedule not in ('cosine', 'constant'):
+            raise ValueError(f"lr_schedule must be 'cosine' or 'constant', got {self.lr_schedule!r}")
+        if self.warmup_steps < 0:
+            raise ValueError(f'warmup_steps must be >= 0, got {self.warmup_steps}')
+        if not 0.0 <= self.min_lr_frac <= 1.0:
+            raise ValueError(f'min_lr_frac must be in [0, 1], got {self.min_lr_frac}')
 
 
 def pick_device(name: str = 'auto') -> torch.device:
@@ -35,6 +48,17 @@ def pick_device(name: str = 'auto') -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device('mps')
     return torch.device('cpu')
+
+
+def lr_factor(step: int, total_steps: int, cfg: TrainConfig) -> float:
+    """Multiplier on `cfg.lr` for optimizer step `step` (0-based) of `total_steps`."""
+    if cfg.lr_schedule == 'constant':
+        return 1.0
+    warmup = min(cfg.warmup_steps, total_steps // 2)  # short runs still get a decay phase
+    if step < warmup:
+        return (step + 1) / warmup
+    progress = (step - warmup) / max(total_steps - 1 - warmup, 1)
+    return cfg.min_lr_frac + (1 - cfg.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
 
 def batches(idx: np.ndarray, size: int, shuffle: bool, rng: np.random.Generator):
@@ -82,6 +106,8 @@ def train(data_path: Path, out_dir: Path, fold: int | None, n_folds: int,
     model = GhostDefense(model_cfg).to(dev)
     print(f'parameters: {sum(p.numel() for p in model.parameters()):,}')
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    total_steps = cfg.epochs * math.ceil(len(train_idx) / cfg.batch_size)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: lr_factor(step, total_steps, cfg))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / 'model.pt'
@@ -93,19 +119,22 @@ def train(data_path: Path, out_dir: Path, fold: int | None, n_folds: int,
             start = time.time()
             model.train()
             beta = cfg.beta * min(1.0, epoch / max(cfg.beta_warmup, 1))
-            train_loss, n = 0.0, 0
+            train_loss, n, lr_sum, steps = 0.0, 0, 0.0, 0
             for b in batches(train_idx, cfg.batch_size, True, rng):
                 batch = data.batch(b.to(dev))
                 terms = elbo_loss(model(batch), batch, model_cfg.obs_frames, beta)
                 opt.zero_grad()
                 terms['loss'].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                lr_sum += opt.param_groups[0]['lr']
+                steps += 1
                 opt.step()
+                sched.step()
                 train_loss += float(terms['loss']) * len(b)
                 n += len(b)
 
             val = evaluate(model, data, val_idx, cfg, rng)
-            row = {'epoch': epoch, 'beta': beta, 'train_loss': train_loss / n,
+            row = {'epoch': epoch, 'beta': beta, 'lr': lr_sum / steps, 'train_loss': train_loss / n,
                    **{f'val_{k}': v for k, v in val.items()}, 'seconds': time.time() - start}
             if log is None:
                 log = csv.DictWriter(log_file, fieldnames=list(row))
