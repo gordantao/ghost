@@ -108,3 +108,15 @@ def test_padding_does_not_leak(model, batch):
 def test_obs_frames_must_leave_observed_and_predicted_frames(obs_frames):
     with pytest.raises(ValueError):
         ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, obs_frames=obs_frames)
+
+
+def test_return_coverage_reports_the_drawn_calls(model, batch):
+    gen = lambda: torch.Generator().manual_seed(5)  # noqa: E731
+    samples, call = model.sample(batch, k=4, generator=gen(), return_coverage=True)
+    assert call.shape == (3, 4)
+    assert torch.equal(samples, model.sample(batch, k=4, generator=gen()))
+    for j in range(4):
+        fixed = model.sample(batch, k=4, coverage=call[:, j], generator=gen())
+        assert torch.allclose(samples[:, j], fixed[:, j], atol=1e-5)
+    _, fixed_call = model.sample(batch, k=4, coverage=batch['coverage'], return_coverage=True)
+    assert torch.equal(fixed_call, batch['coverage'][:, None].expand(-1, 4))

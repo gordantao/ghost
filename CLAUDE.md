@@ -22,6 +22,7 @@ ghost preprocess --raw data/raw/bdb2023 --raw data/raw/bdb2025 --out data/proces
 ghost train --fold 0                   # one cross-fitting fold -> runs/default/fold0/{model.pt,metrics.csv}
 ghost train --fold all                 # train on everything (no held-out plays)
 ghost score                            # needs every fold -> runs/default/scores/*.csv
+ghost sample-size [--eps 0.05 --quantile 0.9 | --delta YARDS]   # how many ghost samples score needs -> runs/default/sample_size/ (Longleaf: scripts/sample_size.sbatch)
 ghost animate [--play-id N --game-id G] [--actual-call]   # random play by default -> runs/default/animations/*.gif
 ```
 
@@ -29,7 +30,7 @@ Every `ModelConfig` and `TrainConfig` field is also a CLI flag (`--d-model`, `--
 
 **Local memory limit:** the dev machine is a MacBook with 8 GB of RAM total. Never run anything locally that could use more than about 4 GB. That rules out training, benchmarking, or scoring on the real cache (`PlayData.load` alone puts about 260 MB on the device, and a default-size model at batch 16 already overwhelmed the OS). Run real-data training and scoring on Longleaf. Locally, stick to `pytest` (tiny synthetic tensors), `ghost preprocess`, and small read-only checks of the data.
 
-**Longleaf:** `data/` is gitignored, so copy `data/raw/bdb2023/` (about 950 MB) and `data/raw/bdb2025/` (about 8 GB) over separately. Then create the env from `environment.yaml`, run `pip install -e .`, then `ghost preprocess`, then `scripts/submit.sh [extra train flags]`. That submits a 5-task fold array (`train_folds.sbatch`) and a scoring job that waits for it (`score.sbatch`). Set `RUNS=runs/<name>` to choose the output dir. Logs go to `logs/`.
+**Longleaf:** `data/` is gitignored, so copy `data/raw/bdb2023/` (about 950 MB) and `data/raw/bdb2025/` (about 8 GB) over separately. Then create the env from `environment.yaml`, run `pip install -e .`, then `ghost preprocess`, then `scripts/submit.sh [extra train flags]`. That submits a 5-task fold array (`train_folds.sbatch`) and a scoring job that waits for it (`score.sbatch`). Set `RUNS=runs/<name>` to choose the output dir. Logs go to `logs/`. The sbatch scripts call `$HOME/.conda/envs/ghost/bin/python -m ghost.cli` (override with `PYTHON=`) on the `a100-gpu` partition with `module load cuda/12.9`. `ghost score` defaults to the cache path saved in the checkpoints, so if you copy a run dir back locally, the matching cache has to be at the same relative path.
 
 ## Architecture
 
@@ -43,7 +44,7 @@ Every `ModelConfig` and `TrainConfig` field is also a CLI flag (`--d-model`, `--
 
 - `model.FEATURE_SCALE` scales the dynamic features by position in the list, so it must stay in step with `preprocess.DYN_FEATURES`. If you add or reorder a feature, update both. The input sizes (`n_dyn`, `n_glob`) come from the cache, so any preprocessing change means re-running `ghost preprocess` and retraining.
 - Checkpoints don't store their held-out play indices. `score.py` recomputes them from the cache's `game_id` order plus `fold`, `n_folds`, `seed` and `val_frac` saved in the checkpoint. Don't re-preprocess between training and scoring, or the split changes. `score` loads the cache path saved in the checkpoints, and it refuses to run if the folds disagree on `n_folds`, `seed`, `val_frac` or the cache, if any fold is missing or extra, or if the cache's play-order fingerprint has changed.
-- The real-data training loop has not been run end to end yet (the first local attempt ran out of memory). Treat default hyperparameters as untuned until a Longleaf run's `metrics.csv` has been reviewed.
+- One full Longleaf pipeline has run: `runs/longleaf_default/` (copied back locally) holds 5 folds, `scores/` and a few animations. It used the BDB 2023-only cache with `max_frames` 50 (before the default became 70) and default hyperparameters, so it can't be re-scored against today's caches. Defaults are still untuned beyond that one run. Its per-epoch `metrics.csv` columns (`val_recon`, `val_kl`, `val_coverage_nll`, `val_coverage_acc`, `val_ade*`) are the place to compare experiments.
 
 ## Invariants the tests guard
 

@@ -42,57 +42,93 @@ def nearest_defender_distance(receivers: torch.Tensor, defenders: torch.Tensor) 
 
 
 @torch.no_grad()
+def ghost_separation(samples: torch.Tensor, batch: dict, obs_frames: int) -> torch.Tensor:
+    """[B, K, 11] per ghost sample, the frame-mean distance from each offensive player
+    to the nearest ghost defender over the predicted frames."""
+    offense = batch['dyn'][:, :, OFF, :2]
+    dist = nearest_defender_distance(offense[:, None], samples)                      # [B, K, T, 11]
+    mask = future_mask(batch['time_mask'], obs_frames)[:, None, :, None].float()
+    return (dist * mask).sum(2) / mask.sum(2)
+
+
+@torch.no_grad()
 def heliocentricity(samples: torch.Tensor, batch: dict, obs_frames: int) -> dict[str, torch.Tensor]:
     """Per-(play, offensive player) expected and actual separation, and H.
 
     samples: [B, K, T, 11, 2] ghost defenders. Returns [B, 11] tensors.
     """
-    offense = batch['dyn'][:, :, OFF, :2]
-    actual = nearest_defender_distance(offense, batch['dyn'][:, :, DEF, :2])         # [B, T, 11]
-    expected = nearest_defender_distance(offense[:, None], samples).mean(dim=1)      # [B, T, 11]
-    mask = future_mask(batch['time_mask'], obs_frames)[:, :, None].float()
-    n = mask.sum(1)
+    expected_sep = ghost_separation(samples, batch, obs_frames).mean(1)
+    actual_sep = actual_separation(batch, obs_frames)
+    n = future_mask(batch['time_mask'], obs_frames).sum(1, keepdim=True).float()
     return {
-        'expected_sep': (expected * mask).sum(1) / n,
-        'actual_sep': (actual * mask).sum(1) / n,
-        'H': ((expected - actual) * mask).sum(1) / n,
-        'n_frames': n.expand(-1, offense.shape[2]),
+        'expected_sep': expected_sep,
+        'actual_sep': actual_sep,
+        'H': expected_sep - actual_sep,
+        'n_frames': n.expand_as(actual_sep),
     }
+
+
+def actual_separation(batch: dict, obs_frames: int) -> torch.Tensor:
+    """[B, 11] frame-mean distance from each offensive player to the nearest real defender."""
+    return ghost_separation(batch['dyn'][:, None, :, DEF, :2], batch, obs_frames)[:, 0]
+
+
+def two_ghosts(model, batch: dict, n_samples: int, seed: int, return_coverage: bool = False):
+    """(total, within) ghost samples: one draws its own call, the other runs the actual call.
+
+    Both use one seed, so they share their z noise (common random numbers) and
+    H_call reflects the call, not Monte Carlo noise. With `return_coverage`,
+    also returns the calls the total ghost drew [B, K].
+    """
+    gen = lambda: torch.Generator(batch['dyn'].device).manual_seed(seed)  # noqa: E731
+    total = model.sample(batch, n_samples, generator=gen(), return_coverage=return_coverage)
+    within = model.sample(batch, n_samples, coverage=batch['coverage'], generator=gen())
+    return (*total, within) if return_coverage else (total, within)
+
+
+def fold_batches(ckpt: dict, data: PlayData, plays: np.ndarray, batch_size: int, device: torch.device):
+    """Yield (play indices, batch, batch seed), seeded from the fold's training seed."""
+    torch.manual_seed(ckpt['train_config']['seed'])
+    for i in range(0, len(plays), batch_size):
+        idx = plays[i:i + batch_size]
+        batch = data.batch(torch.from_numpy(idx).to(device))
+        yield idx, batch, int(torch.randint(2 ** 62, ()))
+
+
+def held_out_plays(ckpt: dict, data: PlayData) -> np.ndarray:
+    """Indices of the plays this fold's model never trained on."""
+    _, _, held_out = split_indices(data.game_id, ckpt['fold'], ckpt['n_folds'],
+                                   ckpt['train_config']['val_frac'], ckpt['train_config']['seed'])
+    return held_out
+
+
+def receiver_rows(data: PlayData, idx: np.ndarray, batch: dict, cols: dict[str, np.ndarray]) -> pd.DataFrame:
+    """One row per scored receiver on the batch's plays; `cols` holds [B, 11] arrays."""
+    group = batch['group'][:, OFF].cpu().numpy()
+    coverage_vocab = data.meta['coverage_vocab']
+    rows = pd.DataFrame({
+        'game_id': np.repeat(data.game_id[idx], 11),
+        'play_id': np.repeat(data.play_id[idx], 11),
+        'nfl_id': data.nfl_id[idx][:, OFF].ravel(),
+        'group': [GROUP_VOCAB[g] for g in group.ravel()],
+        'coverage': np.repeat([coverage_vocab[c] for c in batch['coverage'].cpu().numpy()], 11),
+        **{k: v.ravel() for k, v in cols.items()},
+    })
+    return rows[np.isin(group.ravel(), RECEIVER_IDS)]
 
 
 def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
                device: torch.device) -> pd.DataFrame:
     model, ckpt = load_model(ckpt_path, device)
-    seed = ckpt['train_config']['seed']
-    _, _, held_out = split_indices(data.game_id, ckpt['fold'], ckpt['n_folds'],
-                                   ckpt['train_config']['val_frac'], seed)
-    torch.manual_seed(seed)
-    coverage_vocab = data.meta['coverage_vocab']
-
     frames = []
-    for i in range(0, len(held_out), batch_size):
-        idx = held_out[i:i + batch_size]
-        batch = data.batch(torch.from_numpy(idx).to(device))
-        # Same z noise for both ghosts, so H_call reflects the call, not Monte Carlo noise.
-        batch_seed = int(torch.randint(2 ** 62, ()))
-        gen = lambda: torch.Generator(device).manual_seed(batch_seed)  # noqa: E731
-        total = heliocentricity(model.sample(batch, n_samples, generator=gen()), batch, model.cfg.obs_frames)
-        within = heliocentricity(model.sample(batch, n_samples, coverage=batch['coverage'], generator=gen()),
-                                 batch, model.cfg.obs_frames)
-        group = batch['group'][:, OFF].cpu().numpy()
+    for idx, batch, seed in fold_batches(ckpt, data, held_out_plays(ckpt, data), batch_size, device):
+        total, within = (heliocentricity(s, batch, model.cfg.obs_frames)
+                         for s in two_ghosts(model, batch, n_samples, seed))
         cols = {k: v.cpu().numpy() for k, v in total.items()}
         cols['expected_sep_within'] = within['expected_sep'].cpu().numpy()
         cols['H_within'] = within['H'].cpu().numpy()
         cols['H_call'] = cols['H'] - cols['H_within']
-        play_rows = pd.DataFrame({
-            'game_id': np.repeat(data.game_id[idx], 11),
-            'play_id': np.repeat(data.play_id[idx], 11),
-            'nfl_id': data.nfl_id[idx][:, OFF].ravel(),
-            'group': [GROUP_VOCAB[g] for g in group.ravel()],
-            'coverage': np.repeat([coverage_vocab[c] for c in batch['coverage'].cpu().numpy()], 11),
-            **{k: v.ravel() for k, v in cols.items()},
-        })
-        frames.append(play_rows[np.isin(group.ravel(), RECEIVER_IDS)])
+        frames.append(receiver_rows(data, idx, batch, cols))
     out = pd.concat(frames, ignore_index=True)
     out['fold'] = ckpt['fold']
     return out
@@ -148,8 +184,9 @@ def check_checkpoints(ckpts: list[Path]) -> tuple[Path, str]:
     return Path(metas[0]['data_path']), metas[0]['data_fingerprint']
 
 
-def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
-          batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto') -> None:
+def load_cross_fit(data_path: Path | None, runs_dir: Path,
+                   device: str) -> tuple[list[Path], PlayData, torch.device]:
+    """Every fold checkpoint of a run, and the unchanged cache they trained on, on `device`."""
     ckpts = sorted(runs_dir.glob('fold*/model.pt'))
     if not ckpts:
         raise FileNotFoundError(f'no fold*/model.pt checkpoints under {runs_dir}')
@@ -165,7 +202,12 @@ def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int 
         raise ValueError(f'{data_path} has changed since training (play order differs); '
                          'scoring would rebuild the wrong held-out splits')
     data.to(dev)
+    return ckpts, data, dev
 
+
+def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
+          batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto') -> None:
+    ckpts, data, dev = load_cross_fit(data_path, runs_dir, device)
     plays = pd.concat([score_fold(c, data, n_samples, batch_size, dev) for c in ckpts], ignore_index=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     plays.to_csv(out_dir / 'play_receiver_scores.csv', index=False)
