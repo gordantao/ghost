@@ -11,6 +11,9 @@ standard error <= delta:
 
     K = ceil((quantile of s across play-receivers / delta) ** 2)
 
+The quantile is the observed s at or above it, not an interpolated value, so
+at least that share is guaranteed to meet delta.
+
 By default delta = sqrt(eps * V), where V is the variance of H across
 play-receivers net of Monte Carlo noise, so sampling noise is at most an `eps`
 share of the real spread. Pass `delta` (yards) to fix it instead.
@@ -110,7 +113,7 @@ def recommend(spread: pd.DataFrame, n_samples: int, eps: float = 0.05, quantile:
         mc_var = (s ** 2).mean()
         V = spread[q].var() - mc_var / n_samples        # spread of H across play-receivers, net of MC noise
         tol = delta if delta is not None else math.sqrt(eps * V) if V > 0 else math.nan
-        s_q = s.quantile(quantile)
+        s_q = s.quantile(quantile, interpolation='higher')  # an observed s, so >= `quantile` meet delta
         k = max(2, math.ceil((s_q / tol) ** 2)) if tol > 0 else math.nan
         if math.isnan(k):
             print(f'warning: {q} shows no spread beyond Monte Carlo noise (V = {V:.3g}); pass --delta to size it')

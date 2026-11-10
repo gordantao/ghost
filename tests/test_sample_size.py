@@ -72,12 +72,16 @@ def test_recommend_sets_delta_from_the_real_spread():
     assert np.isnan(out.loc['H_call', 'between_call_share'])
 
 
-def test_recommend_uses_the_quantile_of_s_and_a_fixed_delta():
-    spread = _spread()
-    spread['s_H'] = np.linspace(0.0, 2.0, len(spread))
+def test_recommend_meets_the_requested_share_with_a_fixed_delta():
+    spread = _spread(n=25)
+    spread['s_H'] = [0.1] * 22 + [1.0] * 3      # a linear 0.9-quantile (0.64) would give K=41 and only 88%
     out = recommend(spread, n_samples=128, quantile=0.9, delta=0.1).set_index('quantity')
-    assert out.loc['H', 'K'] == math.ceil((spread.s_H.quantile(0.9) / 0.1) ** 2)
-    assert out.loc['H', 'share_within_delta'] == pytest.approx(0.9, abs=0.01)
+    assert out.loc['H', 's_quantile'] == 1.0 and out.loc['H', 'K'] == 100
+    assert out.loc['H', 'share_within_delta'] >= 0.9
+
+    spread['s_H'] = np.linspace(0.0, 2.0, len(spread))
+    for q in (0.5, 0.9, 0.95):
+        assert recommend(spread, n_samples=128, quantile=q, delta=0.1).share_within_delta[0] >= q
 
 
 def test_recommend_reports_nan_when_h_has_no_real_spread():
