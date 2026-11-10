@@ -180,13 +180,14 @@ class GhostDefense(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch: dict, k: int, coverage: torch.Tensor | None = None,
-               generator: torch.Generator | None = None) -> torch.Tensor:
+               generator: torch.Generator | None = None, return_coverage: bool = False):
         """K ghost-defense futures from the prior: [B, K, T, 11, 2].
 
         By default each sample draws its own call from p(c | context) and never
         reads batch['coverage']. Pass `coverage` [B] to fix the call instead.
         The z noise is drawn before the call, so two calls with identically
-        seeded generators share it (common random numbers).
+        seeded generators share it (common random numbers). With
+        `return_coverage`, also returns each sample's call [B, K].
         """
         h, ctx, coverage_logits = self.encode(batch)
         B = h.shape[0]
@@ -201,7 +202,8 @@ class GhostDefense(nn.Module):
         z = mu + eps * (0.5 * logvar).exp()
         batch_k = {'dyn': rep(batch['dyn']), 'time_mask': rep(batch['time_mask'])}
         pred = self.decode(rep(h), z, c, batch_k)
-        return pred.reshape(B, k, *pred.shape[1:])
+        pred = pred.reshape(B, k, *pred.shape[1:])
+        return (pred, c.reshape(B, k)) if return_coverage else pred
 
 
 def future_mask(time_mask: torch.Tensor, obs_frames: int) -> torch.Tensor:

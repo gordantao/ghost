@@ -59,6 +59,22 @@ def main(argv: list[str] | None = None) -> None:
                    help='players.csv for names; repeatable (default: every release in data/raw)')
     p.add_argument('--device', default='auto')
 
+    p = sub.add_parser('sample-size', help='how many ghost samples score needs (per-play Monte Carlo error)')
+    p.add_argument('--data', type=Path, default=None, help='default: the cache the folds trained on')
+    p.add_argument('--runs', type=Path, default=DEFAULT_RUNS)
+    p.add_argument('--out', type=Path, default=None, help='default: <runs>/sample_size')
+    p.add_argument('--samples', type=int, default=128, help='ghost samples per play for estimating their spread')
+    p.add_argument('--batch-size', type=int, default=8)
+    p.add_argument('--eps', type=float, default=0.05,
+                   help='largest share of the real spread of H that Monte Carlo noise may be')
+    p.add_argument('--quantile', type=float, default=0.9,
+                   help='share of play-receivers whose standard error must be within the tolerance')
+    p.add_argument('--delta', type=float, default=None,
+                   help='tolerance on the standard error in yards (default: sqrt(eps * V))')
+    p.add_argument('--plays-per-fold', type=int, default=None, help='random subset of each fold (default: all)')
+    p.add_argument('--current-k', type=int, default=16, help='K to compare against (score --samples)')
+    p.add_argument('--device', default='auto')
+
     p = sub.add_parser('animate', help='animate one play with its ghost defense (random by default)')
     p.add_argument('--runs', type=Path, default=DEFAULT_RUNS)
     p.add_argument('--play-id', type=int, default=None, help='default: a random play')
@@ -88,6 +104,10 @@ def main(argv: list[str] | None = None) -> None:
         from .score import score
         score(args.data, args.runs, args.out or args.runs / 'scores', args.samples,
               args.batch_size, args.players or DEFAULT_PLAYERS, args.device)
+    elif args.command == 'sample-size':
+        from .sample_size import sample_size
+        sample_size(args.data, args.runs, args.out or args.runs / 'sample_size', args.samples, args.batch_size,
+                    args.eps, args.quantile, args.delta, args.plays_per_fold, args.current_k, args.device)
     elif args.command == 'animate':
         from .animate import animate
         animate(args.runs, args.out, args.game_id, args.play_id, args.samples, args.actual_call,
