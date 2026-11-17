@@ -110,12 +110,23 @@ def test_obs_frames_must_leave_observed_and_predicted_frames(obs_frames):
         ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, obs_frames=obs_frames)
 
 
-def test_eval_forward_decodes_the_posterior_mean(model, batch):
+def test_forward_generator_makes_the_posterior_draw_reproducible(model, batch):
+    gen = lambda: torch.Generator().manual_seed(3)  # noqa: E731
     model.eval()
     with torch.no_grad():
-        a, b = model(batch), model(batch)
-    assert torch.equal(a['pred'], b['pred'])  # validation loss carries no sampling noise
-    model.train()
-    with torch.no_grad():
-        c, d = model(batch), model(batch)
-    assert not torch.equal(c['pred'], d['pred'])  # training still samples z
+        a, b = model(batch, generator=gen()), model(batch, generator=gen())
+        c = model(batch, generator=torch.Generator().manual_seed(4))
+    assert torch.equal(a['pred'], b['pred'])  # seeded validation carries no run-to-run noise
+    assert not torch.equal(a['pred'], c['pred'])  # but still samples z rather than taking the mean
+
+
+def test_return_coverage_reports_the_drawn_calls(model, batch):
+    gen = lambda: torch.Generator().manual_seed(5)  # noqa: E731
+    samples, call = model.sample(batch, k=4, generator=gen(), return_coverage=True)
+    assert call.shape == (3, 4)
+    assert torch.equal(samples, model.sample(batch, k=4, generator=gen()))
+    for j in range(4):
+        fixed = model.sample(batch, k=4, coverage=call[:, j], generator=gen())
+        assert torch.allclose(samples[:, j], fixed[:, j], atol=1e-5)
+    _, fixed_call = model.sample(batch, k=4, coverage=batch['coverage'], return_coverage=True)
+    assert torch.equal(fixed_call, batch['coverage'][:, None].expand(-1, 4))

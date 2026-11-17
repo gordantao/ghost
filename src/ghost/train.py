@@ -72,12 +72,12 @@ def batches(idx: np.ndarray, size: int, shuffle: bool, rng: np.random.Generator)
 def evaluate(model: GhostDefense, data: PlayData, idx: np.ndarray, cfg: TrainConfig,
              rng: np.random.Generator) -> dict[str, float]:
     model.eval()
-    # Same ghost noise every epoch, so the sample metrics compare across epochs.
+    # Same posterior and ghost noise every epoch, so validation metrics compare across epochs.
     generator = torch.Generator(device=data.length.device).manual_seed(cfg.seed)
     totals, n = {}, 0
     for b in batches(idx, cfg.batch_size, False, rng):
         batch = data.batch(b.to(data.length.device))
-        terms = elbo_loss(model(batch), batch, model.cfg.obs_frames, cfg.beta)
+        terms = elbo_loss(model(batch, generator=generator), batch, model.cfg.obs_frames, cfg.beta)
         terms['ade_mean'], terms['ade_min'] = sample_ade(
             model.sample(batch, cfg.eval_samples, generator=generator), batch, model.cfg.obs_frames)
         for key, value in terms.items():
@@ -110,6 +110,9 @@ def train(data_path: Path, out_dir: Path, fold: int | None, n_folds: int,
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     total_steps = cfg.epochs * math.ceil(len(train_idx) / cfg.batch_size)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: lr_factor(step, total_steps, cfg))
+    if cfg.lr_schedule != 'constant':
+        print(f'lr schedule: {cfg.lr_schedule}, {total_steps} steps, '
+              f'warmup {min(cfg.warmup_steps, total_steps // 2)}')
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / 'model.pt'

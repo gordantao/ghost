@@ -168,30 +168,32 @@ class GhostDefense(nn.Module):
         anchor = batch['dyn'][:, self.cfg.obs_frames - 1, DEF, :2]
         return anchor[:, None] + POS_SCALE * self.out(x[:, :, DEF])
 
-    def forward(self, batch: dict) -> dict[str, torch.Tensor]:
+    def forward(self, batch: dict, generator: torch.Generator | None = None) -> dict[str, torch.Tensor]:
         """Training pass: decode from a posterior sample with the true call; return loss terms.
 
-        In eval mode the posterior mean is decoded instead of a sample, so
-        validation loss is deterministic and checkpoint selection doesn't
-        chase Monte Carlo noise.
+        Validation passes a seeded `generator`, so its loss is deterministic
+        across epochs but still an unbiased ELBO estimate (decoding the
+        posterior mean would drop the cost of a wide q from the reconstruction).
         """
         h, ctx, coverage_logits = self.encode(batch)
         mu_p, logvar_p = self.prior(ctx, batch['coverage'])
         mu_q, logvar_q = self.posterior(batch, ctx)
-        z = mu_q + torch.randn_like(mu_q) * (0.5 * logvar_q).exp() if self.training else mu_q
+        eps = torch.randn(mu_q.shape, device=mu_q.device, generator=generator)
+        z = mu_q + eps * (0.5 * logvar_q).exp()
         pred = self.decode(h, z, batch['coverage'], batch)
         return {'pred': pred, 'kl': gaussian_kl(mu_q, logvar_q, mu_p, logvar_p),
                 'coverage_logits': coverage_logits}
 
     @torch.no_grad()
     def sample(self, batch: dict, k: int, coverage: torch.Tensor | None = None,
-               generator: torch.Generator | None = None) -> torch.Tensor:
+               generator: torch.Generator | None = None, return_coverage: bool = False):
         """K ghost-defense futures from the prior: [B, K, T, 11, 2].
 
         By default each sample draws its own call from p(c | context) and never
         reads batch['coverage']. Pass `coverage` [B] to fix the call instead.
         The z noise is drawn before the call, so two calls with identically
-        seeded generators share it (common random numbers).
+        seeded generators share it (common random numbers). With
+        `return_coverage`, also returns each sample's call [B, K].
         """
         h, ctx, coverage_logits = self.encode(batch)
         B = h.shape[0]
@@ -206,7 +208,8 @@ class GhostDefense(nn.Module):
         z = mu + eps * (0.5 * logvar).exp()
         batch_k = {'dyn': rep(batch['dyn']), 'time_mask': rep(batch['time_mask'])}
         pred = self.decode(rep(h), z, c, batch_k)
-        return pred.reshape(B, k, *pred.shape[1:])
+        pred = pred.reshape(B, k, *pred.shape[1:])
+        return (pred, c.reshape(B, k)) if return_coverage else pred
 
 
 def future_mask(time_mask: torch.Tensor, obs_frames: int) -> torch.Tensor:
