@@ -134,7 +134,8 @@ def recommend(spread: pd.DataFrame, n_samples: int, eps: float = 0.05, quantile:
 
 def sample_size(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 128,
                 batch_size: int = 8, eps: float = 0.05, quantile: float = 0.9, delta: float | None = None,
-                plays_per_fold: int | None = None, current_k: int = 16, device: str = 'auto') -> pd.DataFrame:
+                plays_per_fold: int | None = None, current_k: int = 16, device: str = 'auto',
+                include_blockers: bool = False) -> pd.DataFrame:
     # Checked up front: a bad value would otherwise fail only after all the sampling.
     if n_samples < 2:
         raise ValueError('need at least 2 samples per play to estimate their spread')
@@ -150,6 +151,8 @@ def sample_size(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples
                        ignore_index=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     spread.to_csv(out_dir / 'play_receiver_spread.csv', index=False)   # saved first: it's the expensive part
+    if not include_blockers:
+        spread = spread[spread.ran_route]
     summary = recommend(spread, n_samples, eps, quantile, delta, current_k)
     summary.to_csv(out_dir / 'summary.csv', index=False)
     with pd.option_context('display.width', 200, 'display.max_columns', None):
