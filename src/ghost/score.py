@@ -141,13 +141,17 @@ def receiver_rows(data: PlayData, idx: np.ndarray, batch: dict, cols: dict[str, 
     return rows[np.isin(group.ravel(), RECEIVER_IDS)]
 
 
-def frame_arrays(batch: dict, h_t: torch.Tensor, obs_frames: int) -> tuple[np.ndarray, np.ndarray]:
-    """([N, T] per-frame H, [N, T] predicted-frame mask) for each scored receiver, in `receiver_rows` order."""
+def frame_arrays(batch: dict, h_t: torch.Tensor, obs_frames: int, width: int) -> tuple[np.ndarray, np.ndarray]:
+    """([N, width] per-frame H, [N, width] predicted-frame mask) for each scored receiver, in `receiver_rows` order.
+
+    Batches are trimmed to their longest play, so both are right-padded (0, False) to the cache's `width`.
+    """
     group = batch['group'][:, OFF].cpu().numpy().ravel()
     keep = np.isin(group, RECEIVER_IDS)
     h = h_t.permute(0, 2, 1).reshape(-1, h_t.shape[1]).cpu().numpy()[keep]
-    valid = future_mask(batch['time_mask'], obs_frames).cpu().numpy()
-    return h, np.repeat(valid, 11, axis=0)[keep]
+    valid = np.repeat(future_mask(batch['time_mask'], obs_frames).cpu().numpy(), 11, axis=0)[keep]
+    pad = ((0, 0), (0, width - h.shape[1]))
+    return np.pad(h, pad), np.pad(valid, pad)
 
 
 def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
@@ -155,6 +159,7 @@ def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
     """Per-(play, receiver) rows, and the per-frame arrays `H_t`, `H_within_t`, `valid` ([N, T], same row order)."""
     model, ckpt = load_model(ckpt_path, device)
     obs = model.cfg.obs_frames
+    width = data.dyn.shape[1]
     frames, h_ts, hw_ts, valids = [], [], [], []
     for idx, batch, seed in fold_batches(ckpt, data, held_out_plays(ckpt, data), batch_size, device):
         total, within = (heliocentricity(s, batch, obs) for s in two_ghosts(model, batch, n_samples, seed))
@@ -163,9 +168,9 @@ def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
         cols['H_within'] = within['H'].cpu().numpy()
         cols['H_call'] = cols['H'] - cols['H_within']
         frames.append(receiver_rows(data, idx, batch, cols))
-        h, valid = frame_arrays(batch, total['H_t'], obs)
+        h, valid = frame_arrays(batch, total['H_t'], obs, width)
         h_ts.append(h)
-        hw_ts.append(frame_arrays(batch, within['H_t'], obs)[0])
+        hw_ts.append(frame_arrays(batch, within['H_t'], obs, width)[0])
         valids.append(valid)
     out = pd.concat(frames, ignore_index=True)
     out['fold'] = ckpt['fold']
@@ -191,7 +196,9 @@ def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: n
                   min_rows: int = MIN_CELL_ROWS) -> np.ndarray:
     """[N] per-row mean over predicted frames of H_t minus its (fold, group, frame offset) cell mean.
 
-    h_t, valid: [N, T]. Late offsets are pooled per `offset_buckets`.
+    h_t, valid: [N, T]. Late offsets are pooled per `offset_buckets`. Each offset's residuals
+    average to 0 over the rows scored there, so a cell's row means are only approximately 0
+    when play lengths vary (zero frame-weighted, not row-weighted).
     """
     out = np.zeros(len(h_t))
     n_frames = np.maximum(valid.sum(1), 1)
@@ -204,7 +211,7 @@ def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: n
         total = np.bincount(np.broadcast_to(bucket, h.shape)[v], weights=h[v], minlength=k)
         count = np.bincount(np.broadcast_to(bucket, h.shape)[v], minlength=k)
         mean = np.where(count > 0, total / np.maximum(count, 1), 0.0)
-        out[rows] = ((h - mean[bucket]) * v).sum(1) / n_frames[rows]
+        out[rows] = np.where(v, h - mean[bucket], 0.0).sum(1) / n_frames[rows]
     return out
 
 
@@ -241,13 +248,30 @@ def clustered_se(plays: pd.DataFrame, col: str) -> pd.Series:
     return se.reindex(n.index)
 
 
-def shrink(mean: pd.Series, se: pd.Series, group: pd.Series, n_plays: pd.Series) -> pd.Series:
+def pooled_play_var(plays: pd.DataFrame, col: str, group: pd.Series) -> pd.Series:
+    """nfl_id -> pooled within-player play-level variance of `col` over the player's position group."""
+    resid2 = (plays[col] - plays.groupby('nfl_id')[col].transform('mean')) ** 2
+    ss = resid2.groupby(plays.nfl_id).sum()
+    n = plays.groupby('nfl_id').size()
+    out = pd.Series(np.nan, index=n.index)
+    for g in group.unique():
+        in_g = (group == g).to_numpy()
+        out[in_g] = ss[in_g].sum() / max(n[in_g].sum() - in_g.sum(), 1)
+    return out
+
+
+def shrink(mean: pd.Series, se: pd.Series, group: pd.Series, n_plays: pd.Series,
+           play_var: pd.Series | None = None) -> pd.Series:
     """Empirical-Bayes shrinkage of player means toward their position-group mean.
 
     shrunk = m + B (x - m), B = tau2 / (tau2 + se^2). m is the group's play-weighted mean;
     tau2 is per group by method of moments: the variance of the player means minus their
-    mean se^2, floored at 0. A player with no SE is shrunk all the way to m.
+    mean se^2, floored at 0. With `play_var` (pooled play-level variance), a player's se^2 is
+    floored at play_var / n, so a few agreeing games can't give a near-zero clustered SE (and a
+    player seen in one game gets that floor). Without it, a player with no SE is shrunk fully to m.
     """
+    if play_var is not None:
+        se = np.sqrt(np.fmax(se ** 2, play_var / n_plays))
     out = pd.Series(np.nan, index=mean.index)
     for g in group.unique():
         in_g = (group == g).to_numpy()
@@ -276,7 +300,8 @@ def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None) -> p
         for c in centered:
             stats[f'{c}_mean'] = plays.groupby('nfl_id')[c].mean()
             stats[f'{c}_se'] = clustered_se(plays, c)
-            stats[f'{c}_shrunk'] = shrink(stats[f'{c}_mean'], stats[f'{c}_se'], stats.group, stats.n_plays)
+            stats[f'{c}_shrunk'] = shrink(stats[f'{c}_mean'], stats[f'{c}_se'], stats.group, stats.n_plays,
+                                          pooled_play_var(plays, c, stats.group))
         sort_by = 'H_centered_shrunk'
     else:
         sort_by = 'H_mean'
@@ -337,9 +362,7 @@ def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int 
     ckpts, data, dev = load_cross_fit(data_path, runs_dir, device)
     folds = [score_fold(c, data, n_samples, batch_size, dev) for c in ckpts]
     plays = pd.concat([f for f, _ in folds], ignore_index=True)
-    width = max(a['valid'].shape[1] for _, a in folds)
-    pad = lambda a: np.pad(a, ((0, 0), (0, width - a.shape[1])))  # noqa: E731
-    arrays = {k: np.concatenate([pad(a[k]) for _, a in folds]) for k in folds[0][1]}
+    arrays = {k: np.concatenate([a[k] for _, a in folds]) for k in folds[0][1]}
     del folds
     add_centered(plays, arrays)
     out_dir.mkdir(parents=True, exist_ok=True)

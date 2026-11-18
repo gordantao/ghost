@@ -5,9 +5,11 @@ import pandas as pd
 import pytest
 import torch
 
-from ghost.preprocess import DEF
+from ghost.model import GhostDefense, ModelConfig
+from ghost.preprocess import DEF, GROUP_VOCAB, N_ENT
 from ghost.score import (add_centered, aggregate_players, center_frames, check_checkpoints, clustered_se,
-                         heliocentricity, offset_buckets, player_names, shrink)
+                         heliocentricity, offset_buckets, player_names, pooled_play_var, score_fold, shrink)
+import ghost.score as score_mod
 
 
 def test_h_is_zero_when_ghosts_match_reality(batch):
@@ -164,3 +166,69 @@ def test_aggregate_players_adds_centered_columns_and_sorts_by_shrunk():
     for c in ('H_centered_mean', 'H_centered_se', 'H_centered_shrunk', 'H_call_centered_shrunk'):
         assert c in stats
     assert stats.H_centered_shrunk.is_monotonic_decreasing
+
+
+def test_centering_with_variable_play_lengths_removes_length_and_offset_drift():
+    rng = np.random.default_rng(3)
+    n, T = 2000, 40
+    length = rng.integers(10, T + 1, n)
+    valid = np.arange(T)[None] < length[:, None]
+    valid[:, :2] = False
+    h_t = 0.02 * np.arange(T) + rng.normal(0, 0.3, (n, T))
+    fold, group = np.zeros(n, int), np.full(n, 'WR')
+    centered = center_frames(h_t, valid, fold, group, min_rows=1)
+    nf = valid.sum(1)
+    raw = np.where(valid, h_t, 0).sum(1) / nf
+    assert np.corrcoef(raw, nf)[0, 1] > 0.3 and abs(np.corrcoef(centered, nf)[0, 1]) < 0.1
+    assert abs(centered.mean()) < 0.02                                        # approximately, not exactly, 0
+    # one offset's drift removed: shifting only offset 20 of the data changes nothing after centering
+    shifted = h_t.copy()
+    shifted[:, 20] += 5.0
+    assert np.allclose(center_frames(shifted, valid, fold, group, min_rows=1), centered)
+    assert not np.allclose(raw, np.where(valid, shifted, 0).sum(1) / nf)
+
+
+def test_shrinkage_floor_keeps_two_game_player_from_topping_the_ranking():
+    rng = np.random.default_rng(4)
+    rows = [pd.DataFrame({'nfl_id': i, 'game_id': np.arange(60) % 15, 'x': rng.normal(0.1 * rng.normal(), 1, 60)})
+            for i in range(50)]
+    rows.append(pd.DataFrame({'nfl_id': 99, 'game_id': [0, 1], 'x': [1.5, 1.52]}))
+    plays = pd.concat(rows, ignore_index=True)
+    n = plays.groupby('nfl_id').size()
+    mean = plays.groupby('nfl_id').x.mean()
+    group = pd.Series('WR', index=mean.index)
+    se = clustered_se(plays, 'x')
+    unfloored = shrink(mean, se, group, n)
+    floored = shrink(mean, se, group, n, pooled_play_var(plays, 'x', group))
+    assert unfloored.idxmax() == 99
+    assert floored.idxmax() != 99 and floored[99] < 0.7
+
+
+def test_score_fold_pads_batches_to_the_cache_width(monkeypatch):
+    torch.manual_seed(0)
+    cfg = ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, obs_frames=2, d_model=32, n_heads=2,
+                      n_enc_layers=1, n_post_layers=1, n_dec_layers=1, d_latent=4, dropout=0.0)
+    model = GhostDefense(cfg).eval()
+    n = 40
+
+    class Stub:
+        length = torch.randint(5, 20, (n,))
+        dyn = torch.randn(n, 20, N_ENT, 7)
+        group = torch.full((n, N_ENT), GROUP_VOCAB.index('WR'))
+        glob = torch.randn(n, 5)
+        coverage = torch.randint(0, 4, (n,))
+        game_id = np.repeat(np.arange(10), 4)
+        play_id = np.arange(n)
+        nfl_id = np.tile(np.arange(N_ENT), (n, 1))
+        meta = {'coverage_vocab': list('abcd')}
+
+        def batch(self, idx):
+            from ghost.data import PlayData
+            return PlayData.batch(self, idx)
+
+    ckpt = {'fold': 0, 'n_folds': 2, 'train_config': {'seed': 0, 'val_frac': 0.1}}
+    monkeypatch.setattr(score_mod, 'load_model', lambda p, d: (model, ckpt))
+    monkeypatch.setattr(score_mod, 'held_out_plays', lambda c, d: np.arange(n))
+    rows, arrays = score_fold(None, Stub(), 2, 8, torch.device('cpu'))
+    assert arrays['H_t'].shape == arrays['valid'].shape == (len(rows), 20)
+    assert np.isfinite(arrays['H_t']).all() and not arrays['valid'][:, :2].any()
