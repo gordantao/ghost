@@ -107,11 +107,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == 'score':
         from .score import score
         score(args.data, args.runs, args.out or args.runs / 'scores', args.samples,
-              args.batch_size, args.players or DEFAULT_PLAYERS, args.device, args.include_blockers)
+              args.batch_size, args.players or DEFAULT_PLAYERS, args.device, include_blockers=args.include_blockers)
     elif args.command == 'sample-size':
         from .sample_size import sample_size
         sample_size(args.data, args.runs, args.out or args.runs / 'sample_size', args.samples, args.batch_size,
-                    args.eps, args.quantile, args.delta, args.plays_per_fold, args.current_k, args.device, args.include_blockers)
+                    args.eps, args.quantile, args.delta, args.plays_per_fold, args.current_k, args.device,
+                    include_blockers=args.include_blockers)
     elif args.command == 'animate':
         from .animate import animate
         animate(args.runs, args.out, args.game_id, args.play_id, args.samples, args.actual_call,

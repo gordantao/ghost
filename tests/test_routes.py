@@ -1,10 +1,11 @@
 import numpy as np
+import pytest
 import pandas as pd
 import torch
 
 from ghost.data import PlayData
 from ghost.preprocess import N_ENT, OFF
-from ghost.routes import load_route_labels, route_flags, rule_ran_route
+from ghost.routes import check_label_coverage, load_route_labels, route_flags, rule_ran_route
 from ghost.score import aggregate_players, receiver_rows
 
 
@@ -98,3 +99,35 @@ def test_aggregate_players_include_blockers_keeps_every_play():
     stats = aggregate_players(_plays(), None, include_blockers=True).set_index('nfl_id')
     assert stats.loc[1, 'n_plays'] == 3 and stats.loc[1, 'H_mean'] == 11.0 / 3
     assert 2 in stats.index
+
+
+def test_missing_label_for_labelled_season_raises(tmp_path):
+    game, play = np.array([1, 2]), np.array([10, 20])
+    season = np.array([2021, 2022])
+    labels = pd.DataFrame({'game_id': [1], 'play_id': [10], 'nfl_id': [5], 'ran_route': [True]})
+    with pytest.raises(FileNotFoundError, match='1 plays'):
+        check_label_coverage(season, game, play, labels, ['data/raw/bdb2025'])
+    with pytest.raises(FileNotFoundError):
+        check_label_coverage(season, game, play, None, ['data/raw/bdb2025'])
+    # 2021 plays need no label; old caches without a season are skipped
+    check_label_coverage(np.array([2021, 2021]), game, play, None, [])
+    check_label_coverage(None, game, play, None, [])
+
+
+def test_relative_sources_resolve_against_base(tmp_path):
+    raw = tmp_path / 'data' / 'raw' / 'bdb2025'
+    raw.mkdir(parents=True)
+    pd.DataFrame({'gameId': [1], 'playId': [1], 'nflId': [1], 'wasRunningRoute': [1]}).to_csv(
+        raw / 'player_play.csv', index=False)
+    assert load_route_labels(['data/raw/bdb2025'], base=tmp_path) is not None
+
+
+def test_cli_passes_include_blockers(monkeypatch):
+    import ghost.score
+    import ghost.cli
+    seen = {}
+    monkeypatch.setattr(ghost.score, 'score', lambda *a, **k: seen.update(k))
+    ghost.cli.main(['score'])
+    assert seen['include_blockers'] is False
+    ghost.cli.main(['score', '--include-blockers'])
+    assert seen['include_blockers'] is True

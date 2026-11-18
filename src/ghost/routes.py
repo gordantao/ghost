@@ -9,8 +9,7 @@ Two sources, per play:
          time from the raw dirs in the cache's metadata (`sources`), so the
          cache and its fingerprint are untouched. A player missing from, or NaN
          in, a labelled play counts as not running a route.
-  rule   BDB 2023 has no label, and neither does a play whose raw dir isn't on
-         disk. The rule uses only the cached tracking: a receiver ran a route
+  rule   BDB 2023 has no label. The rule uses only the cached tracking: a receiver ran a route
          if he ended the window at least 5 yards from where he started, or
          within 2 yards of the line of scrimmage or beyond it (x >= -2; x is
          measured from the ball at the snap). Blockers hold their depth: an RB
@@ -42,6 +41,8 @@ from .preprocess import OFF
 ROUTE_MIN_DISPLACEMENT = 5.0   # yards from the snap position to the last frame
 ROUTE_MIN_END_X = -2.0         # yards from the line of scrimmage; at or beyond this counts
 
+LABELLED_FROM_SEASON = 2022    # BDB 2025 onward ships wasRunningRoute
+
 KEY = ['game_id', 'play_id']
 
 
@@ -57,11 +58,18 @@ def rule_ran_route(dyn: torch.Tensor, time_mask: torch.Tensor) -> torch.Tensor:
     return (displacement >= ROUTE_MIN_DISPLACEMENT) | (end[..., 0] >= ROUTE_MIN_END_X)
 
 
-def load_route_labels(sources: list[str | Path]) -> pd.DataFrame | None:
-    """`wasRunningRoute` rows (game_id, play_id, nfl_id, ran_route) from every raw dir that has them."""
+def load_route_labels(sources: list[str | Path], base: Path | None = None) -> pd.DataFrame | None:
+    """`wasRunningRoute` rows (game_id, play_id, nfl_id, ran_route) from every raw dir that has them.
+
+    `sources` are the cache metadata's paths, relative to the repo root. A relative one is tried
+    against the cwd first, then against `base` (the repo root the cache lives under).
+    """
     tables = []
     for src in sources:
-        path = Path(src) / 'player_play.csv'
+        src = Path(src)
+        path = src / 'player_play.csv'
+        if not path.exists() and base is not None and not src.is_absolute():
+            path = base / src / 'player_play.csv'
         if not path.exists() or 'wasRunningRoute' not in pd.read_csv(path, nrows=0).columns:
             continue
         t = pd.read_csv(path, usecols=['gameId', 'playId', 'nflId', 'wasRunningRoute'])
@@ -89,3 +97,24 @@ def route_flags(game_id: np.ndarray, play_id: np.ndarray, nfl_id: np.ndarray, ru
         ran[use] = label[use]
         source[use] = 'label'
     return ran, source
+
+
+def check_label_coverage(season: np.ndarray | None, game_id: np.ndarray, play_id: np.ndarray,
+                         labels: pd.DataFrame | None, sources: list[str | Path]) -> None:
+    """Raise if a season that has labels would silently fall back to the tracking rule.
+
+    The rule is much noisier than the label (RB accuracy 0.83), so a missing raw dir
+    (or `ghost score` run from outside the repo root) must not go unnoticed.
+    """
+    if season is None:
+        return
+    expected = np.asarray(season) >= LABELLED_FROM_SEASON
+    if not expected.any():
+        return
+    have = set(zip(*(labels[KEY].drop_duplicates().to_numpy().T.tolist()))) if labels is not None and len(labels) else set()
+    missing = sum(1 for g, p, e in zip(game_id.tolist(), play_id.tolist(), expected) if e and (g, p) not in have)
+    if missing:
+        raise FileNotFoundError(
+            f'{missing} plays from season >= {LABELLED_FROM_SEASON} have no wasRunningRoute label; '
+            f'player_play.csv was not found under {[str(s) for s in sources]}. Copy the raw dir there '
+            'and run `ghost score` from the repo root, or the plays would silently fall back to the noisier tracking rule.')

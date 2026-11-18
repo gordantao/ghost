@@ -31,7 +31,7 @@ import torch
 from .data import PlayData, split_indices
 from .model import future_mask
 from .preprocess import DEF, GROUP_VOCAB, OFF, RECEIVER_GROUPS
-from .routes import load_route_labels, route_flags, rule_ran_route
+from .routes import check_label_coverage, load_route_labels, route_flags, rule_ran_route
 from .train import load_model, pick_device
 
 RECEIVER_IDS = [GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS]
@@ -218,7 +218,10 @@ def load_cross_fit(data_path: Path | None, runs_dir: Path,
     if data.fingerprint() != fingerprint:
         raise ValueError(f'{data_path} has changed since training (play order differs); '
                          'scoring would rebuild the wrong held-out splits')
-    data.route_labels = load_route_labels(data.meta.get('sources', []))
+    sources = data.meta.get('sources', [])
+    # sources are repo-root-relative and the cache sits at <root>/data/processed/<name>.npz
+    data.route_labels = load_route_labels(sources, Path(data_path).resolve().parents[2])
+    check_label_coverage(data.season, data.game_id, data.play_id, data.route_labels, sources)
     data.to(dev)
     return ckpts, data, dev
 
