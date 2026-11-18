@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 module load cuda/12.9
-PYTHON="${PYTHON:-$HOME/.conda/envs/ghost/bin/python}"
+source "$SLURM_SUBMIT_DIR/scripts/_env.sh"  # sets $PYTHON, checks it, unbuffers output
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 "$PYTHON" -m ghost.cli train --fold "$SLURM_ARRAY_TASK_ID" --n-folds 5 \

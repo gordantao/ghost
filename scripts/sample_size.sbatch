@@ -18,6 +18,6 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 module load cuda/12.9
-PYTHON="${PYTHON:-$HOME/.conda/envs/ghost/bin/python}"
+source "$SLURM_SUBMIT_DIR/scripts/_env.sh"  # sets $PYTHON, checks it, unbuffers output
 
 "$PYTHON" -m ghost.cli sample-size --runs "${RUNS:-runs/default}" "$@"
