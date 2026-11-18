@@ -10,6 +10,14 @@ H for the (play, receiver) is the mean of H_t. Positive H means the real
 defense played r tighter than a typical defense would have given the same
 offensive movement; that extra attention is the receiver's "gravity".
 
+Raw H carries the model's miscalibration: for a calibrated ghost the mean H in
+any group defined by model inputs is exactly 0, yet real fold models are biased
+by position group and increasingly so at later frames. H_centered subtracts the
+mean H_t of each (fold, position group, frame offset) cell before averaging over
+the play's frames, so what is left is gravity relative to the group's norm.
+Player scores then get game-clustered standard errors and empirical-Bayes
+shrinkage toward the position-group mean.
+
 Two ghosts are scored. For H the ghost draws its coverage call from the model's
 prior, so H is total gravity, including any that shows up in the call itself.
 For H_within the ghost runs the defense's actual call, so H_within is gravity
@@ -34,6 +42,11 @@ from .preprocess import DEF, GROUP_VOCAB, OFF, RECEIVER_GROUPS
 from .train import load_model, pick_device
 
 RECEIVER_IDS = [GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS]
+H_COLS = ('H', 'H_within', 'H_call')
+# A centering cell (fold, group, frame offset) needs at least this many scored rows.
+# Offsets from the first one with fewer rows onward share one pooled cell, so the
+# long tail of rarely-reached late frames doesn't get noisy means.
+MIN_CELL_ROWS = 200
 
 
 def nearest_defender_distance(receivers: torch.Tensor, defenders: torch.Tensor) -> torch.Tensor:
@@ -47,6 +60,11 @@ def ghost_separation(samples: torch.Tensor, batch: dict, obs_frames: int) -> tor
     to the nearest ghost defender over the predicted frames."""
     offense = batch['dyn'][:, :, OFF, :2]
     dist = nearest_defender_distance(offense[:, None], samples)                      # [B, K, T, 11]
+    return masked_frame_mean(dist, batch, obs_frames)
+
+
+def masked_frame_mean(dist: torch.Tensor, batch: dict, obs_frames: int) -> torch.Tensor:
+    """[B, K, T, 11] -> [B, K, 11], the mean over predicted frames."""
     mask = future_mask(batch['time_mask'], obs_frames)[:, None, :, None].float()
     return (dist * mask).sum(2) / mask.sum(2)
 
@@ -55,15 +73,21 @@ def ghost_separation(samples: torch.Tensor, batch: dict, obs_frames: int) -> tor
 def heliocentricity(samples: torch.Tensor, batch: dict, obs_frames: int) -> dict[str, torch.Tensor]:
     """Per-(play, offensive player) expected and actual separation, and H.
 
-    samples: [B, K, T, 11, 2] ghost defenders. Returns [B, 11] tensors.
+    samples: [B, K, T, 11, 2] ghost defenders. Returns [B, 11] tensors, plus
+    `H_t` [B, T, 11], H at every frame (frames the model doesn't predict are
+    meaningless; mask them with `future_mask`).
     """
-    expected_sep = ghost_separation(samples, batch, obs_frames).mean(1)
-    actual_sep = actual_separation(batch, obs_frames)
+    offense = batch['dyn'][:, :, OFF, :2]
+    ghost_dist = nearest_defender_distance(offense[:, None], samples)                # [B, K, T, 11]
+    actual_dist = nearest_defender_distance(offense, batch['dyn'][:, :, DEF, :2])    # [B, T, 11]
+    expected_sep = masked_frame_mean(ghost_dist, batch, obs_frames).mean(1)
+    actual_sep = masked_frame_mean(actual_dist[:, None], batch, obs_frames)[:, 0]
     n = future_mask(batch['time_mask'], obs_frames).sum(1, keepdim=True).float()
     return {
         'expected_sep': expected_sep,
         'actual_sep': actual_sep,
         'H': expected_sep - actual_sep,
+        'H_t': ghost_dist.mean(1) - actual_dist,
         'n_frames': n.expand_as(actual_sep),
     }
 
@@ -117,21 +141,80 @@ def receiver_rows(data: PlayData, idx: np.ndarray, batch: dict, cols: dict[str, 
     return rows[np.isin(group.ravel(), RECEIVER_IDS)]
 
 
+def frame_arrays(batch: dict, h_t: torch.Tensor, obs_frames: int) -> tuple[np.ndarray, np.ndarray]:
+    """([N, T] per-frame H, [N, T] predicted-frame mask) for each scored receiver, in `receiver_rows` order."""
+    group = batch['group'][:, OFF].cpu().numpy().ravel()
+    keep = np.isin(group, RECEIVER_IDS)
+    h = h_t.permute(0, 2, 1).reshape(-1, h_t.shape[1]).cpu().numpy()[keep]
+    valid = future_mask(batch['time_mask'], obs_frames).cpu().numpy()
+    return h, np.repeat(valid, 11, axis=0)[keep]
+
+
 def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
-               device: torch.device) -> pd.DataFrame:
+               device: torch.device) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+    """Per-(play, receiver) rows, and the per-frame arrays `H_t`, `H_within_t`, `valid` ([N, T], same row order)."""
     model, ckpt = load_model(ckpt_path, device)
-    frames = []
+    obs = model.cfg.obs_frames
+    frames, h_ts, hw_ts, valids = [], [], [], []
     for idx, batch, seed in fold_batches(ckpt, data, held_out_plays(ckpt, data), batch_size, device):
-        total, within = (heliocentricity(s, batch, model.cfg.obs_frames)
-                         for s in two_ghosts(model, batch, n_samples, seed))
-        cols = {k: v.cpu().numpy() for k, v in total.items()}
+        total, within = (heliocentricity(s, batch, obs) for s in two_ghosts(model, batch, n_samples, seed))
+        cols = {k: v.cpu().numpy() for k, v in total.items() if k != 'H_t'}
         cols['expected_sep_within'] = within['expected_sep'].cpu().numpy()
         cols['H_within'] = within['H'].cpu().numpy()
         cols['H_call'] = cols['H'] - cols['H_within']
         frames.append(receiver_rows(data, idx, batch, cols))
+        h, valid = frame_arrays(batch, total['H_t'], obs)
+        h_ts.append(h)
+        hw_ts.append(frame_arrays(batch, within['H_t'], obs)[0])
+        valids.append(valid)
     out = pd.concat(frames, ignore_index=True)
     out['fold'] = ckpt['fold']
+    return out, {'H_t': np.concatenate(h_ts), 'H_within_t': np.concatenate(hw_ts),
+                 'valid': np.concatenate(valids)}
+
+
+def offset_buckets(valid: np.ndarray, min_rows: int) -> np.ndarray:
+    """[T] the centering cell of each frame offset: itself, except that the first offset
+    with fewer than `min_rows` scored rows, and every later one, share one cell."""
+    counts = valid.sum(0)
+    seen = np.flatnonzero(counts)
+    bucket = np.arange(valid.shape[1])
+    if len(seen):
+        thin = seen[counts[seen] < min_rows]
+        thin = thin[thin > seen[0]]
+        if len(thin):
+            bucket[thin[0]:] = thin[0]
+    return bucket
+
+
+def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: np.ndarray,
+                  min_rows: int = MIN_CELL_ROWS) -> np.ndarray:
+    """[N] per-row mean over predicted frames of H_t minus its (fold, group, frame offset) cell mean.
+
+    h_t, valid: [N, T]. Late offsets are pooled per `offset_buckets`.
+    """
+    out = np.zeros(len(h_t))
+    n_frames = np.maximum(valid.sum(1), 1)
+    cell = pd.MultiIndex.from_arrays([fold, group]).factorize()[0]
+    for c in np.unique(cell):
+        rows = np.flatnonzero(cell == c)
+        h, v = h_t[rows], valid[rows]
+        bucket = offset_buckets(v, min_rows)
+        k = bucket.max() + 1
+        total = np.bincount(np.broadcast_to(bucket, h.shape)[v], weights=h[v], minlength=k)
+        count = np.bincount(np.broadcast_to(bucket, h.shape)[v], minlength=k)
+        mean = np.where(count > 0, total / np.maximum(count, 1), 0.0)
+        out[rows] = ((h - mean[bucket]) * v).sum(1) / n_frames[rows]
     return out
+
+
+def add_centered(plays: pd.DataFrame, arrays: dict[str, np.ndarray], min_rows: int = MIN_CELL_ROWS) -> pd.DataFrame:
+    """Add H_centered, H_within_centered and H_call_centered to the play-receiver rows."""
+    for name, key in (('H_centered', 'H_t'), ('H_within_centered', 'H_within_t')):
+        plays[name] = center_frames(arrays[key], arrays['valid'], plays.fold.to_numpy(),
+                                    plays.group.to_numpy(), min_rows)
+    plays['H_call_centered'] = plays.H_centered - plays.H_within_centered
+    return plays
 
 
 def player_names(players_csvs: list[Path] | None) -> pd.Series:
@@ -140,6 +223,41 @@ def player_names(players_csvs: list[Path] | None) -> pd.Series:
     if not tables:
         return pd.Series(dtype=str)
     return pd.concat(tables).drop_duplicates('nflId').set_index('nflId').displayName
+
+
+def clustered_se(plays: pd.DataFrame, col: str) -> pd.Series:
+    """nfl_id -> game-clustered standard error of the player's mean of `col`.
+
+    CR-style sandwich for a mean: sqrt(sum_g (sum of residuals in game g)^2) / n, times
+    sqrt(G / (G - 1)) for G games. With one play per game it equals std / sqrt(n).
+    A player seen in one game has no clustered SE (NaN).
+    """
+    resid = plays[col] - plays.groupby('nfl_id')[col].transform('mean')
+    by_game = resid.groupby([plays.nfl_id, plays.game_id]).sum()
+    n_games = by_game.groupby(level=0).size()
+    n = plays.groupby('nfl_id').size()
+    sq = (by_game ** 2).groupby(level=0).sum()
+    se = np.sqrt(sq * n_games / (n_games - 1).where(n_games > 1)) / n
+    return se.reindex(n.index)
+
+
+def shrink(mean: pd.Series, se: pd.Series, group: pd.Series, n_plays: pd.Series) -> pd.Series:
+    """Empirical-Bayes shrinkage of player means toward their position-group mean.
+
+    shrunk = m + B (x - m), B = tau2 / (tau2 + se^2). m is the group's play-weighted mean;
+    tau2 is per group by method of moments: the variance of the player means minus their
+    mean se^2, floored at 0. A player with no SE is shrunk all the way to m.
+    """
+    out = pd.Series(np.nan, index=mean.index)
+    for g in group.unique():
+        in_g = (group == g).to_numpy()
+        x, s2, n = mean[in_g], se[in_g] ** 2, n_plays[in_g]
+        ok = s2.notna()
+        m = np.average(x, weights=n)
+        tau2 = max(x[ok].var(ddof=1) - s2[ok].mean(), 0.0) if ok.sum() > 1 else 0.0
+        b = (tau2 / (tau2 + s2)).fillna(0.0)
+        out[in_g] = m + b * (x - m)
+    return out
 
 
 def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None) -> pd.DataFrame:
@@ -151,12 +269,21 @@ def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None) -> p
         expected_sep=('expected_sep', 'mean'), expected_sep_within=('expected_sep_within', 'mean'),
         actual_sep=('actual_sep', 'mean'),
     )
-    for h in ('H', 'H_within', 'H_call'):
+    for h in H_COLS:
         stats[f'{h}_se'] = stats[f'{h}_std'] / np.sqrt(stats.n_plays)
+    centered = [f'{h}_centered' for h in H_COLS]
+    if all(c in plays for c in centered) and 'game_id' in plays:
+        for c in centered:
+            stats[f'{c}_mean'] = plays.groupby('nfl_id')[c].mean()
+            stats[f'{c}_se'] = clustered_se(plays, c)
+            stats[f'{c}_shrunk'] = shrink(stats[f'{c}_mean'], stats[f'{c}_se'], stats.group, stats.n_plays)
+        sort_by = 'H_centered_shrunk'
+    else:
+        sort_by = 'H_mean'
     names = player_names(players_csvs)
     if len(names):
         stats.insert(0, 'name', names.reindex(stats.index).to_numpy())
-    return stats.sort_values('H_mean', ascending=False).reset_index()
+    return stats.sort_values(sort_by, ascending=False).reset_index()
 
 
 def check_checkpoints(ckpts: list[Path]) -> tuple[Path, str]:
@@ -208,7 +335,13 @@ def load_cross_fit(data_path: Path | None, runs_dir: Path,
 def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
           batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto') -> None:
     ckpts, data, dev = load_cross_fit(data_path, runs_dir, device)
-    plays = pd.concat([score_fold(c, data, n_samples, batch_size, dev) for c in ckpts], ignore_index=True)
+    folds = [score_fold(c, data, n_samples, batch_size, dev) for c in ckpts]
+    plays = pd.concat([f for f, _ in folds], ignore_index=True)
+    width = max(a['valid'].shape[1] for _, a in folds)
+    pad = lambda a: np.pad(a, ((0, 0), (0, width - a.shape[1])))  # noqa: E731
+    arrays = {k: np.concatenate([pad(a[k]) for _, a in folds]) for k in folds[0][1]}
+    del folds
+    add_centered(plays, arrays)
     out_dir.mkdir(parents=True, exist_ok=True)
     plays.to_csv(out_dir / 'play_receiver_scores.csv', index=False)
     aggregate_players(plays, players_csvs).to_csv(out_dir / 'player_scores.csv', index=False)
