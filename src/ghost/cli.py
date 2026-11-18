@@ -1,4 +1,4 @@
-"""Command line entry point: `ghost preprocess | train | score | animate`."""
+"""Command line entry point: `ghost preprocess | train | score | sample-size | calibration | animate`."""
 from __future__ import annotations
 
 import argparse
@@ -75,6 +75,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--current-k', type=int, default=16, help='K to compare against (score --samples)')
     p.add_argument('--device', default='auto')
 
+    p = sub.add_parser('calibration', help='PIT calibration of the ghost nearest-defender distance')
+    p.add_argument('--data', type=Path, default=None, help='default: the cache the folds trained on')
+    p.add_argument('--runs', type=Path, default=DEFAULT_RUNS)
+    p.add_argument('--out', type=Path, default=None, help='default: <runs>/calibration')
+    p.add_argument('--samples', type=int, default=16)
+    p.add_argument('--batch-size', type=int, default=32)
+    p.add_argument('--plays-per-fold', type=int, default=None, help='random subset of each fold (default: all)')
+    p.add_argument('--device', default='auto')
+
     p = sub.add_parser('animate', help='animate one play with its ghost defense (random by default)')
     p.add_argument('--runs', type=Path, default=DEFAULT_RUNS)
     p.add_argument('--play-id', type=int, default=None, help='default: a random play')
@@ -108,6 +117,10 @@ def main(argv: list[str] | None = None) -> None:
         from .sample_size import sample_size
         sample_size(args.data, args.runs, args.out or args.runs / 'sample_size', args.samples, args.batch_size,
                     args.eps, args.quantile, args.delta, args.plays_per_fold, args.current_k, args.device)
+    elif args.command == 'calibration':
+        from .calibration import calibration
+        calibration(args.data, args.runs, args.out or args.runs / 'calibration', args.samples,
+                    args.batch_size, args.plays_per_fold, args.device)
     elif args.command == 'animate':
         from .animate import animate
         animate(args.runs, args.out, args.game_id, args.play_id, args.samples, args.actual_call,

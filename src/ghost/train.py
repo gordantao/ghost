@@ -12,6 +12,7 @@ import torch
 
 from .data import PlayData, split_indices
 from .model import GhostDefense, ModelConfig, elbo_loss, sample_ade
+from .preprocess import OFF
 
 
 @dataclass
@@ -71,19 +72,31 @@ def batches(idx: np.ndarray, size: int, shuffle: bool, rng: np.random.Generator)
 @torch.no_grad()
 def evaluate(model: GhostDefense, data: PlayData, idx: np.ndarray, cfg: TrainConfig,
              rng: np.random.Generator) -> dict[str, float]:
+    from .calibration import pit_values   # lazy: calibration imports score, which imports this module
+    from .score import RECEIVER_IDS
     model.eval()
     # Same posterior and ghost noise every epoch, so validation metrics compare across epochs.
     generator = torch.Generator(device=data.length.device).manual_seed(cfg.seed)
     totals, n = {}, 0
+    pit = np.zeros(4)   # receiver-frame sums: count, u, u == 0, u == 1
     for b in batches(idx, cfg.batch_size, False, rng):
         batch = data.batch(b.to(data.length.device))
         terms = elbo_loss(model(batch, generator=generator), batch, model.cfg.obs_frames, cfg.beta)
-        terms['ade_mean'], terms['ade_min'] = sample_ade(
-            model.sample(batch, cfg.eval_samples, generator=generator), batch, model.cfg.obs_frames)
+        samples = model.sample(batch, cfg.eval_samples, generator=generator)
+        terms['ade_mean'], terms['ade_min'] = sample_ade(samples, batch, model.cfg.obs_frames)
+        # PIT of the nearest-defender distance, from the same samples (no extra draws).
+        u, mask = pit_values(samples, batch, model.cfg.obs_frames)
+        keep = mask[:, :, None] & torch.isin(batch['group'][:, OFF][:, None, :],
+                                             torch.tensor(RECEIVER_IDS, device=u.device))
+        u = u[keep]
+        pit += [u.numel(), float(u.sum()), float((u == 0).sum()), float((u == 1).sum())]
         for key, value in terms.items():
             totals[key] = totals.get(key, 0.0) + float(value) * len(b)
         n += len(b)
-    return {key: value / n for key, value in totals.items()}
+    out = {key: value / n for key, value in totals.items()}
+    if pit[0] > 0:
+        out.update(pit_mean=pit[1] / pit[0], pit_low=pit[2] / pit[0], pit_high=pit[3] / pit[0])
+    return out
 
 
 def train(data_path: Path, out_dir: Path, fold: int | None, n_folds: int,
