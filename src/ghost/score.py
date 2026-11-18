@@ -31,6 +31,7 @@ import torch
 from .data import PlayData, split_indices
 from .model import future_mask
 from .preprocess import DEF, GROUP_VOCAB, OFF, RECEIVER_GROUPS
+from .routes import load_route_labels, route_flags, rule_ran_route
 from .train import load_model, pick_device
 
 RECEIVER_IDS = [GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS]
@@ -103,13 +104,24 @@ def held_out_plays(ckpt: dict, data: PlayData) -> np.ndarray:
 
 
 def receiver_rows(data: PlayData, idx: np.ndarray, batch: dict, cols: dict[str, np.ndarray]) -> pd.DataFrame:
-    """One row per scored receiver on the batch's plays; `cols` holds [B, 11] arrays."""
+    """One row per receiver (WR, TE, RB) on the batch's plays; `cols` holds [B, 11] arrays.
+
+    `ran_route` / `route_source` say whether the receiver ran a route and
+    whether that came from the label or the tracking rule (see routes.py).
+    """
     group = batch['group'][:, OFF].cpu().numpy()
     coverage_vocab = data.meta['coverage_vocab']
+    game_id, play_id = np.repeat(data.game_id[idx], 11), np.repeat(data.play_id[idx], 11)
+    nfl_id = data.nfl_id[idx][:, OFF].ravel()
+    ran_route, route_source = route_flags(game_id, play_id, nfl_id,
+                                          rule_ran_route(batch['dyn'], batch['time_mask']).cpu().numpy().ravel(),
+                                          data.route_labels)
     rows = pd.DataFrame({
-        'game_id': np.repeat(data.game_id[idx], 11),
-        'play_id': np.repeat(data.play_id[idx], 11),
-        'nfl_id': data.nfl_id[idx][:, OFF].ravel(),
+        'game_id': game_id,
+        'play_id': play_id,
+        'nfl_id': nfl_id,
+        'ran_route': ran_route,
+        'route_source': route_source,
         'group': [GROUP_VOCAB[g] for g in group.ravel()],
         'coverage': np.repeat([coverage_vocab[c] for c in batch['coverage'].cpu().numpy()], 11),
         **{k: v.ravel() for k, v in cols.items()},
@@ -142,7 +154,12 @@ def player_names(players_csvs: list[Path] | None) -> pd.Series:
     return pd.concat(tables).drop_duplicates('nflId').set_index('nflId').displayName
 
 
-def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None) -> pd.DataFrame:
+def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None,
+                      include_blockers: bool = False) -> pd.DataFrame:
+    """Per-player means. Plays where the receiver didn't run a route (he stayed in to block) are
+    left out unless `include_blockers`."""
+    if not include_blockers:
+        plays = plays[plays.ran_route]
     stats = plays.groupby('nfl_id').agg(
         group=('group', 'first'), n_plays=('H', 'size'),
         H_mean=('H', 'mean'), H_std=('H', 'std'),
@@ -201,15 +218,18 @@ def load_cross_fit(data_path: Path | None, runs_dir: Path,
     if data.fingerprint() != fingerprint:
         raise ValueError(f'{data_path} has changed since training (play order differs); '
                          'scoring would rebuild the wrong held-out splits')
+    data.route_labels = load_route_labels(data.meta.get('sources', []))
     data.to(dev)
     return ckpts, data, dev
 
 
 def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
-          batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto') -> None:
+          batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto',
+          include_blockers: bool = False) -> None:
     ckpts, data, dev = load_cross_fit(data_path, runs_dir, device)
     plays = pd.concat([score_fold(c, data, n_samples, batch_size, dev) for c in ckpts], ignore_index=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     plays.to_csv(out_dir / 'play_receiver_scores.csv', index=False)
-    aggregate_players(plays, players_csvs).to_csv(out_dir / 'player_scores.csv', index=False)
-    print(f'scored {plays.play_id.size} play-receiver pairs from {len(ckpts)} folds -> {out_dir}')
+    aggregate_players(plays, players_csvs, include_blockers).to_csv(out_dir / 'player_scores.csv', index=False)
+    print(f'scored {plays.play_id.size} play-receiver pairs from {len(ckpts)} folds '
+          f'({int(plays.ran_route.sum())} ran a route) -> {out_dir}')

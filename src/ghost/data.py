@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 
@@ -21,6 +22,7 @@ class PlayData:
     game_id: np.ndarray      # [P]
     play_id: np.ndarray      # [P]
     meta: dict
+    route_labels: pd.DataFrame | None = None   # wasRunningRoute rows, attached by score.load_cross_fit
 
     @classmethod
     def load(cls, path: Path) -> 'PlayData':

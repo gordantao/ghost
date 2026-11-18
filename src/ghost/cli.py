@@ -57,6 +57,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--batch-size', type=int, default=32)
     p.add_argument('--players', type=Path, action='append', default=None,
                    help='players.csv for names; repeatable (default: every release in data/raw)')
+    p.add_argument('--include-blockers', action='store_true',
+                   help='also aggregate plays where the receiver stayed in to block (default: route runners only)')
     p.add_argument('--device', default='auto')
 
     p = sub.add_parser('sample-size', help='how many ghost samples score needs (per-play Monte Carlo error)')
@@ -73,6 +75,8 @@ def main(argv: list[str] | None = None) -> None:
                    help='tolerance on the standard error in yards (default: sqrt(eps * V))')
     p.add_argument('--plays-per-fold', type=int, default=None, help='random subset of each fold (default: all)')
     p.add_argument('--current-k', type=int, default=16, help='K to compare against (score --samples)')
+    p.add_argument('--include-blockers', action='store_true',
+                   help='also count plays where the receiver stayed in to block (default: route runners only)')
     p.add_argument('--device', default='auto')
 
     p = sub.add_parser('animate', help='animate one play with its ghost defense (random by default)')
@@ -103,11 +107,11 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == 'score':
         from .score import score
         score(args.data, args.runs, args.out or args.runs / 'scores', args.samples,
-              args.batch_size, args.players or DEFAULT_PLAYERS, args.device)
+              args.batch_size, args.players or DEFAULT_PLAYERS, args.device, args.include_blockers)
     elif args.command == 'sample-size':
         from .sample_size import sample_size
         sample_size(args.data, args.runs, args.out or args.runs / 'sample_size', args.samples, args.batch_size,
-                    args.eps, args.quantile, args.delta, args.plays_per_fold, args.current_k, args.device)
+                    args.eps, args.quantile, args.delta, args.plays_per_fold, args.current_k, args.device, args.include_blockers)
     elif args.command == 'animate':
         from .animate import animate
         animate(args.runs, args.out, args.game_id, args.play_id, args.samples, args.actual_call,
