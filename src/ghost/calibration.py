@@ -11,15 +11,21 @@ nearest-ghost-defender distances D_t^(k). The PIT value is
 For a calibrated ghost u is roughly Uniform(0, 1): mean 0.5, and the real
 distance falls below every ghost about as often as above every ghost. Ghosts
 that are too loose (farther from receivers than the real defense) push u
-toward 0, so mean u < 0.5; ghosts that are too tight push it toward 1. With
-finite K, u takes values in {0, 1/(2K), ...} so the histogram is only
-approximately flat even for a perfect ghost.
+toward 0, so mean u < 0.5; ghosts that are too tight push it toward 1.
+
+With finite K, u sits on a 1/K grid (K+1 values), so a calibrated ghost has
+share u == 0 = share u == 1 = 1/(K+1), not 0. The flatness histogram is therefore
+a rank histogram: K+1 bins, bin r counting the receiver-frames whose real distance
+has r ghosts below it (ties split, then floored). It is exactly flat under
+calibration for any K, unlike a 10-bin histogram of u, which aliases. Training's
+val_pit_low / val_pit_high use K = --eval-samples (default 6, baseline 1/7).
 
 Both ghosts of `score` are checked: the default one that draws its own call
 and the one given the actual call.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +39,6 @@ from .score import (RECEIVER_IDS, fold_batches, held_out_plays, load_cross_fit, 
                     receiver_rows, two_ghosts)
 from .train import load_model
 
-N_BINS = 10
 FRAMES_PER_SECOND = 10
 OFFSET_BINS = ['0-0.9s', '1-1.9s', '2-2.9s', '3s+']      # seconds after the snap
 
@@ -58,10 +63,10 @@ def offset_bin(frame: np.ndarray) -> np.ndarray:
     return np.minimum(frame // FRAMES_PER_SECOND, len(OFFSET_BINS) - 1)
 
 
-def pit_stat_rows(u: torch.Tensor, mask: torch.Tensor, batch: dict) -> pd.DataFrame:
+def pit_stat_rows(u: torch.Tensor, mask: torch.Tensor, batch: dict, n_samples: int) -> pd.DataFrame:
     """One row per (group, offset bin) of this batch's receiver-frames, holding sums to aggregate.
 
-    Columns: group, offset, n, u (sum), low (count u == 0), high (count u == 1), h0..h9 (histogram counts).
+    Columns: group, offset, n, u (sum), low (count u == 0), high (count u == 1), h0..hK (rank histogram counts, K = n_samples).
     """
     group = batch['group'][:, OFF][:, None, :].expand_as(u)                         # [B, T, 11]
     frame = torch.arange(u.shape[1], device=u.device)[None, :, None].expand_as(u)
@@ -69,21 +74,22 @@ def pit_stat_rows(u: torch.Tensor, mask: torch.Tensor, batch: dict) -> pd.DataFr
     u, group, frame = u[keep].cpu().numpy(), group[keep].cpu().numpy(), frame[keep].cpu().numpy()
     df = pd.DataFrame({'group': [GROUP_VOCAB[g] for g in group], 'offset': offset_bin(frame),
                        'n': 1, 'u': u, 'low': u == 0, 'high': u == 1})
-    bins = np.minimum((u * N_BINS).astype(int), N_BINS - 1)
-    for b in range(N_BINS):
-        df[f'h{b}'] = bins == b
+    rank = np.floor(u * n_samples + 1e-6).astype(int)        # ghosts below the real value, ties split
+    for b in range(n_samples + 1):
+        df[f'h{b}'] = rank == b
     return df.groupby(['group', 'offset'], as_index=False).sum()
 
 
 def summarize(stats: pd.DataFrame) -> pd.DataFrame:
     """Turn summed stat rows (with a `ghost` column) into the overall / by-group / by-offset summary."""
-    hist = [f'h{b}' for b in range(N_BINS)]
+    hist = [c for c in stats.columns if re.fullmatch(r'h\d+', c)]
+    k = len(hist) - 1
     stats = stats.assign(offset=[OFFSET_BINS[o] for o in stats.offset])
     parts = []
     for ghost, g in stats.groupby('ghost'):
         for stratum, by in (('overall', None), ('group', 'group'), ('offset', 'offset')):
-            sums = g.drop(columns=['ghost', 'group', 'offset']).sum().to_frame().T if by is None else \
-                g.groupby(by)[['n', 'u', 'low', 'high', *hist]].sum().reset_index()
+            sums = g.assign(_all='all').groupby('_all' if by is None else by)[['n', 'u', 'low', 'high', *hist]] \
+                .sum().reset_index(drop=by is None)
             sums.insert(0, 'level', 'all' if by is None else sums[by])
             sums.insert(0, 'stratum', stratum)
             sums.insert(0, 'ghost', ghost)
@@ -93,8 +99,9 @@ def summarize(stats: pd.DataFrame) -> pd.DataFrame:
     out['mean_u'] = out.u / n
     out['share_u0'] = out.low / n
     out['share_u1'] = out.high / n
-    out[[f'hist{b}' for b in range(N_BINS)]] = out[hist].div(n, axis=0).to_numpy()
-    cols = ['ghost', 'stratum', 'level', 'n', 'mean_u', 'share_u0', 'share_u1'] + [f'hist{b}' for b in range(N_BINS)]
+    out[[f'rank{b}' for b in range(k + 1)]] = out[hist].div(n, axis=0).to_numpy()
+    out['k'] = k
+    cols = ['ghost', 'stratum', 'level', 'k', 'n', 'mean_u', 'share_u0', 'share_u1'] + [f'rank{b}' for b in range(k + 1)]
     return out[cols]
 
 
@@ -112,7 +119,7 @@ def calibrate_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: 
         cols = {}
         for ghost, samples in zip(('own_call', 'actual_call'), two_ghosts(model, batch, n_samples, seed)):
             u, mask = pit_values(samples, batch, obs)
-            stats.append(pit_stat_rows(u, mask, batch).assign(ghost=ghost))
+            stats.append(pit_stat_rows(u, mask, batch, n_samples).assign(ghost=ghost))
             m = mask[:, :, None].float()
             cols[f'u_mean_{ghost}'] = ((u * m).sum(1) / m.sum(1)).cpu().numpy()
         per_play.append(receiver_rows(data, idx, batch, cols))

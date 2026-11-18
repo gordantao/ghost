@@ -4,12 +4,12 @@ import pytest
 import torch
 
 from ghost import cli
-from ghost.calibration import N_BINS, OFFSET_BINS, calibration, offset_bin, pit_stat_rows, pit_values, summarize
+from ghost.calibration import OFFSET_BINS, calibration, offset_bin, pit_stat_rows, pit_values, summarize
 from ghost.data import PlayData
 from ghost.model import GhostDefense, ModelConfig, elbo_loss, sample_ade
 from ghost.preprocess import DEF, GROUP_VOCAB, N_ENT, OFF
 from ghost.score import RECEIVER_IDS
-from ghost.train import TrainConfig, evaluate
+from ghost.train import TrainConfig, evaluate, train
 
 from test_train import _synthetic_cache
 
@@ -31,7 +31,7 @@ def test_pit_is_uniform_when_ghosts_match_reality():
     u, mask = pit_values(samples, batch, obs_frames=2)
     u = u[mask[:, :, None].expand_as(u)]
     assert u.mean() == pytest.approx(0.5, abs=0.01)
-    hist = torch.histc(u, N_BINS, 0, 1) / u.numel()
+    hist = torch.histc(u, 10, 0, 1) / u.numel()
     assert hist.min() > 0.09 and hist.max() < 0.11
     assert (u == 0).float().mean() == pytest.approx(1 / 101, abs=0.005)    # exactly 1/(K+1)
 
@@ -54,6 +54,16 @@ def test_pit_counts_ties_as_half(batch):
     assert mask.shape == (3, 12) and not mask[:, :2].any()
 
 
+def test_rank_histogram_is_flat_at_default_k_for_a_matched_ghost():
+    samples, batch = _plays(B=600, K=16)
+    u, mask = pit_values(samples, batch, obs_frames=2)
+    stats = pit_stat_rows(u, mask, batch, 16).assign(ghost='own_call')
+    overall = summarize(stats).query("stratum == 'overall'").iloc[0]
+    shares = overall[[f'rank{b}' for b in range(17)]].astype(float)
+    assert (shares - 1 / 17).abs().max() < 0.02
+    assert overall.share_u0 == pytest.approx(1 / 17, abs=0.01)
+
+
 def test_offset_bins_are_seconds_at_ten_hertz():
     assert offset_bin(np.array([0, 9, 10, 19, 20, 29, 30, 69])).tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
     assert len(OFFSET_BINS) == 4
@@ -63,7 +73,7 @@ def test_summary_is_consistent_across_strata():
     samples, batch = _plays(B=30, T=40)
     batch['group'] = torch.tensor(RECEIVER_IDS)[torch.randint(0, len(RECEIVER_IDS), (30, N_ENT))]
     u, mask = pit_values(samples, batch, obs_frames=2)
-    stats = pit_stat_rows(u, mask, batch).assign(ghost='own_call')
+    stats = pit_stat_rows(u, mask, batch, 16).assign(ghost='own_call')
     summary = summarize(stats)
     overall = summary[summary.stratum == 'overall'].iloc[0]
     n_receivers = sum(int((batch['group'][:, OFF] == g).sum()) for g in RECEIVER_IDS)
@@ -74,8 +84,9 @@ def test_summary_is_consistent_across_strata():
         assert (part.mean_u * part.n).sum() / overall.n == pytest.approx(overall.mean_u)
     assert set(summary[summary.stratum == 'offset'].level) == set(OFFSET_BINS)
     assert set(summary[summary.stratum == 'group'].level) <= {GROUP_VOCAB[g] for g in RECEIVER_IDS}
-    hist = overall[[f'hist{b}' for b in range(N_BINS)]].astype(float)
+    hist = overall[[f'rank{b}' for b in range(17)]].astype(float)
     assert hist.sum() == pytest.approx(1.0)
+    assert overall.k == 16 and pd.api.types.is_integer_dtype(summary.n)
 
 
 def test_non_receivers_are_excluded(batch):
@@ -83,7 +94,7 @@ def test_non_receivers_are_excluded(batch):
     batch['group'] = torch.full_like(batch['group'], len(GROUP_VOCAB) - 1)
     assert RECEIVER_IDS.count(len(GROUP_VOCAB) - 1) == 0
     u, mask = pit_values(samples, batch, obs_frames=2)
-    assert pit_stat_rows(u, mask, batch).empty
+    assert pit_stat_rows(u, mask, batch, 4).empty
 
 
 def _small_setup(tmp_path):
@@ -129,3 +140,30 @@ def test_cli_wires_up_calibration(monkeypatch, tmp_path):
     cli.main(['calibration', '--runs', str(tmp_path), '--samples', '4', '--plays-per-fold', '10'])
     data, runs, out, k, bs, per_fold, device = seen['args']
     assert runs == tmp_path and out == tmp_path / 'calibration' and (k, per_fold) == (4, 10)
+
+
+def _train_folds(tmp_path):
+    cache = tmp_path / 'cache.npz'
+    _synthetic_cache(cache)
+    runs = tmp_path / 'runs'
+    small = {'d_model': 16, 'n_heads': 2, 'n_enc_layers': 1, 'n_post_layers': 1, 'n_dec_layers': 1, 'd_latent': 4}
+    for fold in range(5):
+        train(cache, runs / f'fold{fold}', fold, 5, small, TrainConfig(epochs=1, batch_size=8, eval_samples=2),
+              device='cpu')
+    return runs
+
+
+@pytest.mark.parametrize('plays_per_fold', [None, 2])
+def test_calibration_end_to_end(tmp_path, plays_per_fold):
+    runs = _train_folds(tmp_path)
+    out = tmp_path / 'out'
+    summary = calibration(None, runs, out, n_samples=4, batch_size=4, plays_per_fold=plays_per_fold, device='cpu')
+    per_play = pd.read_csv(out / 'pit_play_receiver.csv')
+    assert (out / 'pit_summary.csv').exists() and len(per_play) > 0
+    overall = summary[summary.stratum == 'overall'].set_index('ghost')
+    assert set(overall.index) == {'own_call', 'actual_call'}
+    for ghost in overall.index:
+        assert overall.loc[ghost, [f'rank{b}' for b in range(5)]].astype(float).sum() == pytest.approx(1.0)
+    assert overall.n.nunique() == 1 and overall.n.iloc[0] > 0
+    if plays_per_fold:
+        assert per_play.groupby('fold').size().max() <= plays_per_fold * 11
