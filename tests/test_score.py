@@ -55,7 +55,7 @@ def test_check_checkpoints_rejects_mixed_seeds(tmp_path):
 
 
 def test_aggregate_players_splits_total_and_within_call():
-    plays = pd.DataFrame({'nfl_id': [1, 1, 2], 'group': 'WR', 'H': [1.0, 3.0, 0.5],
+    plays = pd.DataFrame({'nfl_id': [1, 1, 2], 'group': 'WR', 'ran_route': True, 'H': [1.0, 3.0, 0.5],
                           'H_within': [0.5, 1.5, 0.5], 'expected_sep': 4.0,
                           'expected_sep_within': 3.5, 'actual_sep': 2.0})
     plays['H_call'] = plays.H - plays.H_within
