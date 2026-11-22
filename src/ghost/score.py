@@ -15,8 +15,8 @@ any group defined by model inputs is exactly 0, yet real fold models are biased
 by position group and increasingly so at later frames. H_centered subtracts the
 mean H_t of each (fold, position group, frame offset) cell before averaging over
 the play's frames, so what is left is gravity relative to the group's norm.
-Player scores then get game-clustered standard errors and empirical-Bayes
-shrinkage toward the position-group mean.
+Player scores then get game-clustered standard errors, and players with too
+few plays to rank (by default the lower quartile by play count) are left out.
 
 Two ghosts are scored. For H the ghost draws its coverage call from the model's
 prior, so H is total gravity, including any that shows up in the call itself.
@@ -39,6 +39,7 @@ import torch
 from .data import PlayData, split_indices
 from .model import future_mask
 from .preprocess import DEF, GROUP_VOCAB, OFF, RECEIVER_GROUPS
+from .routes import check_label_coverage, load_route_labels, route_flags, rule_ran_route
 from .train import load_model, pick_device
 
 RECEIVER_IDS = [GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS]
@@ -127,13 +128,24 @@ def held_out_plays(ckpt: dict, data: PlayData) -> np.ndarray:
 
 
 def receiver_rows(data: PlayData, idx: np.ndarray, batch: dict, cols: dict[str, np.ndarray]) -> pd.DataFrame:
-    """One row per scored receiver on the batch's plays; `cols` holds [B, 11] arrays."""
+    """One row per receiver (WR, TE, RB) on the batch's plays; `cols` holds [B, 11] arrays.
+
+    `ran_route` / `route_source` say whether the receiver ran a route and
+    whether that came from the label or the tracking rule (see routes.py).
+    """
     group = batch['group'][:, OFF].cpu().numpy()
     coverage_vocab = data.meta['coverage_vocab']
+    game_id, play_id = np.repeat(data.game_id[idx], 11), np.repeat(data.play_id[idx], 11)
+    nfl_id = data.nfl_id[idx][:, OFF].ravel()
+    ran_route, route_source = route_flags(game_id, play_id, nfl_id,
+                                          rule_ran_route(batch['dyn'], batch['time_mask']).cpu().numpy().ravel(),
+                                          data.route_labels)
     rows = pd.DataFrame({
-        'game_id': np.repeat(data.game_id[idx], 11),
-        'play_id': np.repeat(data.play_id[idx], 11),
-        'nfl_id': data.nfl_id[idx][:, OFF].ravel(),
+        'game_id': game_id,
+        'play_id': play_id,
+        'nfl_id': nfl_id,
+        'ran_route': ran_route,
+        'route_source': route_source,
         'group': [GROUP_VOCAB[g] for g in group.ravel()],
         'coverage': np.repeat([coverage_vocab[c] for c in batch['coverage'].cpu().numpy()], 11),
         **{k: v.ravel() for k, v in cols.items()},
@@ -248,43 +260,19 @@ def clustered_se(plays: pd.DataFrame, col: str) -> pd.Series:
     return se.reindex(n.index)
 
 
-def pooled_play_var(plays: pd.DataFrame, col: str, group: pd.Series) -> pd.Series:
-    """nfl_id -> pooled within-player play-level variance of `col` over the player's position group."""
-    resid2 = (plays[col] - plays.groupby('nfl_id')[col].transform('mean')) ** 2
-    ss = resid2.groupby(plays.nfl_id).sum()
-    n = plays.groupby('nfl_id').size()
-    out = pd.Series(np.nan, index=n.index)
-    for g in group.unique():
-        in_g = (group == g).to_numpy()
-        out[in_g] = ss[in_g].sum() / max(n[in_g].sum() - in_g.sum(), 1)
-    return out
+def lower_quartile_plays(n_plays: pd.Series) -> int:
+    """Default `min_plays`: the 25th percentile of players' play counts, so the lower quartile is dropped."""
+    return int(np.ceil(n_plays.quantile(0.25)))
 
 
-def shrink(mean: pd.Series, se: pd.Series, group: pd.Series, n_plays: pd.Series,
-           play_var: pd.Series | None = None) -> pd.Series:
-    """Empirical-Bayes shrinkage of player means toward their position-group mean.
-
-    shrunk = m + B (x - m), B = tau2 / (tau2 + se^2). m is the group's play-weighted mean;
-    tau2 is per group by method of moments: the variance of the player means minus their
-    mean se^2, floored at 0. With `play_var` (pooled play-level variance), a player's se^2 is
-    floored at play_var / n, so a few agreeing games can't give a near-zero clustered SE (and a
-    player seen in one game gets that floor). Without it, a player with no SE is shrunk fully to m.
-    """
-    if play_var is not None:
-        se = np.sqrt(np.fmax(se ** 2, play_var / n_plays))
-    out = pd.Series(np.nan, index=mean.index)
-    for g in group.unique():
-        in_g = (group == g).to_numpy()
-        x, s2, n = mean[in_g], se[in_g] ** 2, n_plays[in_g]
-        ok = s2.notna()
-        m = np.average(x, weights=n)
-        tau2 = max(x[ok].var(ddof=1) - s2[ok].mean(), 0.0) if ok.sum() > 1 else 0.0
-        b = (tau2 / (tau2 + s2)).fillna(0.0)
-        out[in_g] = m + b * (x - m)
-    return out
-
-
-def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None) -> pd.DataFrame:
+def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None,
+                      include_blockers: bool = False, min_plays: int | None = 0) -> pd.DataFrame:
+    """Per-player means. Plays where the receiver didn't run a route (he stayed in to block) are
+    left out unless `include_blockers`. Players with fewer than `min_plays` of the remaining plays
+    are dropped; None drops the lower quartile of players by play count. The cutoff used is in
+    `.attrs['min_plays']`."""
+    if not include_blockers:
+        plays = plays[plays.ran_route]
     stats = plays.groupby('nfl_id').agg(
         group=('group', 'first'), n_plays=('H', 'size'),
         H_mean=('H', 'mean'), H_std=('H', 'std'),
@@ -300,15 +288,18 @@ def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None) -> p
         for c in centered:
             stats[f'{c}_mean'] = plays.groupby('nfl_id')[c].mean()
             stats[f'{c}_se'] = clustered_se(plays, c)
-            stats[f'{c}_shrunk'] = shrink(stats[f'{c}_mean'], stats[f'{c}_se'], stats.group, stats.n_plays,
-                                          pooled_play_var(plays, c, stats.group))
-        sort_by = 'H_centered_shrunk'
+        sort_by = 'H_centered_mean'
     else:
         sort_by = 'H_mean'
+    if min_plays is None:
+        min_plays = lower_quartile_plays(stats.n_plays)
+    stats = stats[stats.n_plays >= min_plays]
     names = player_names(players_csvs)
     if len(names):
         stats.insert(0, 'name', names.reindex(stats.index).to_numpy())
-    return stats.sort_values(sort_by, ascending=False).reset_index()
+    out = stats.sort_values(sort_by, ascending=False).reset_index()
+    out.attrs['min_plays'] = min_plays
+    return out
 
 
 def check_checkpoints(ckpts: list[Path]) -> tuple[Path, str]:
@@ -353,12 +344,17 @@ def load_cross_fit(data_path: Path | None, runs_dir: Path,
     if data.fingerprint() != fingerprint:
         raise ValueError(f'{data_path} has changed since training (play order differs); '
                          'scoring would rebuild the wrong held-out splits')
+    sources = data.meta.get('sources', [])
+    # sources are repo-root-relative and the cache sits at <root>/data/processed/<name>.npz
+    data.route_labels = load_route_labels(sources, Path(data_path).resolve().parents[2])
+    check_label_coverage(data.season, data.game_id, data.play_id, data.route_labels, sources)
     data.to(dev)
     return ckpts, data, dev
 
 
 def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
-          batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto') -> None:
+          batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto',
+          include_blockers: bool = False, min_plays: int | None = None) -> None:
     ckpts, data, dev = load_cross_fit(data_path, runs_dir, device)
     folds = [score_fold(c, data, n_samples, batch_size, dev) for c in ckpts]
     plays = pd.concat([f for f, _ in folds], ignore_index=True)
@@ -367,5 +363,8 @@ def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int 
     add_centered(plays, arrays)
     out_dir.mkdir(parents=True, exist_ok=True)
     plays.to_csv(out_dir / 'play_receiver_scores.csv', index=False)
-    aggregate_players(plays, players_csvs).to_csv(out_dir / 'player_scores.csv', index=False)
-    print(f'scored {plays.play_id.size} play-receiver pairs from {len(ckpts)} folds -> {out_dir}')
+    players = aggregate_players(plays, players_csvs, include_blockers, min_plays)
+    players.to_csv(out_dir / 'player_scores.csv', index=False)
+    print(f'scored {plays.play_id.size} play-receiver pairs from {len(ckpts)} folds '
+          f'({int(plays.ran_route.sum())} ran a route); {len(players)} players with >= '
+          f'{players.attrs["min_plays"]} plays -> {out_dir}')

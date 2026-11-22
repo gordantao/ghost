@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 
@@ -21,6 +22,8 @@ class PlayData:
     game_id: np.ndarray      # [P]
     play_id: np.ndarray      # [P]
     meta: dict
+    route_labels: pd.DataFrame | None = None   # wasRunningRoute rows, attached by score.load_cross_fit
+    season: np.ndarray | None = None           # [P] season year, when the cache has it
 
     @classmethod
     def load(cls, path: Path) -> 'PlayData':
@@ -33,6 +36,7 @@ class PlayData:
             coverage=torch.from_numpy(arrays['coverage']),
             nfl_id=arrays['nfl_id'], game_id=arrays['game_id'], play_id=arrays['play_id'],
             meta=json.loads(Path(path).with_suffix('.json').read_text()),
+            season=arrays['season'] if 'season' in arrays.files else None,
         )
 
     def fingerprint(self) -> str:

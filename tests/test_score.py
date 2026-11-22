@@ -8,7 +8,7 @@ import torch
 from ghost.model import GhostDefense, ModelConfig
 from ghost.preprocess import DEF, GROUP_VOCAB, N_ENT
 from ghost.score import (add_centered, aggregate_players, center_frames, check_checkpoints, clustered_se,
-                         heliocentricity, offset_buckets, player_names, pooled_play_var, score_fold, shrink)
+                         heliocentricity, lower_quartile_plays, offset_buckets, player_names, score_fold)
 import ghost.score as score_mod
 
 
@@ -59,7 +59,7 @@ def test_check_checkpoints_rejects_mixed_seeds(tmp_path):
 
 
 def test_aggregate_players_splits_total_and_within_call():
-    plays = pd.DataFrame({'nfl_id': [1, 1, 2], 'group': 'WR', 'H': [1.0, 3.0, 0.5],
+    plays = pd.DataFrame({'nfl_id': [1, 1, 2], 'group': 'WR', 'ran_route': True, 'H': [1.0, 3.0, 0.5],
                           'H_within': [0.5, 1.5, 0.5], 'expected_sep': 4.0,
                           'expected_sep_within': 3.5, 'actual_sep': 2.0})
     plays['H_call'] = plays.H - plays.H_within
@@ -139,33 +139,46 @@ def test_clustered_se_exceeds_plain_se_under_within_game_correlation():
     assert clustered_se(plays, 'x')[1] > 1.5 * plays.x.std() / np.sqrt(len(plays))
 
 
-def test_shrinkage_pulls_small_n_players_harder():
-    rng = np.random.default_rng(1)
-    n = pd.Series([2] * 30 + [200] * 30)
-    se = 1.0 / np.sqrt(n)
-    mean = pd.Series(rng.normal(0, 0.8, 60) + rng.normal(0, 1, 60) * se)
-    group = pd.Series('WR', index=mean.index)
-    shrunk = shrink(mean, se, group, n)
-    m = np.average(mean, weights=n)
-    pull = ((mean - shrunk) / (mean - m)).abs()
-    assert pull[:30].mean() > pull[30:].mean() + 0.3
-    assert ((shrunk - m).abs() <= (mean - m).abs() + 1e-12).all()
-
-
-def test_aggregate_players_adds_centered_columns_and_sorts_by_shrunk():
+def test_aggregate_players_adds_centered_columns_and_sorts_by_centered_mean():
     rng = np.random.default_rng(2)
     n = 120
     plays = pd.DataFrame({'nfl_id': rng.integers(0, 12, n), 'game_id': rng.integers(0, 40, n), 'group': 'WR',
-                          'expected_sep': 4.0, 'expected_sep_within': 3.5, 'actual_sep': 2.0})
+                          'ran_route': True, 'expected_sep': 4.0, 'expected_sep_within': 3.5, 'actual_sep': 2.0})
     plays['H'] = rng.normal(0, 1, n)
     plays['H_within'] = plays.H * 0.5
     plays['H_call'] = plays.H - plays.H_within
     for h in ('H', 'H_within', 'H_call'):
         plays[f'{h}_centered'] = plays[h] - plays[h].mean()
     stats = aggregate_players(plays, None)
-    for c in ('H_centered_mean', 'H_centered_se', 'H_centered_shrunk', 'H_call_centered_shrunk'):
+    for c in ('H_centered_mean', 'H_centered_se', 'H_call_centered_mean', 'H_call_centered_se'):
         assert c in stats
-    assert stats.H_centered_shrunk.is_monotonic_decreasing
+    assert not any(c.endswith('_shrunk') for c in stats)
+    assert stats.H_centered_mean.is_monotonic_decreasing
+
+
+def _counted_plays(counts):
+    ids = np.repeat(np.arange(len(counts)), counts)
+    return pd.DataFrame({'nfl_id': ids, 'group': 'WR', 'ran_route': True, 'H': 0.0, 'H_within': 0.0,
+                         'H_call': 0.0, 'expected_sep': 4.0, 'expected_sep_within': 4.0, 'actual_sep': 4.0})
+
+
+def test_min_plays_default_drops_the_lower_quartile_by_play_count():
+    counts = [1, 2, 3, 4, 10, 20, 30, 40]                     # 25th percentile is 2.75 -> cutoff 3
+    stats = aggregate_players(_counted_plays(counts), None, min_plays=None)
+    assert stats.attrs['min_plays'] == lower_quartile_plays(pd.Series(counts)) == 3
+    assert sorted(stats.n_plays) == [3, 4, 10, 20, 30, 40]
+
+
+def test_min_plays_counts_route_plays_only():
+    plays = _counted_plays([5, 5])
+    plays.loc[plays.index[:3], 'ran_route'] = False            # player 0 ran a route on 2 of his 5 plays
+    assert aggregate_players(plays, None, min_plays=3).nfl_id.tolist() == [1]
+    assert sorted(aggregate_players(plays, None, include_blockers=True, min_plays=3).nfl_id) == [0, 1]
+
+
+def test_explicit_min_plays_overrides_the_quartile():
+    stats = aggregate_players(_counted_plays([1, 2, 3, 4, 10]), None, min_plays=0)
+    assert len(stats) == 5 and stats.attrs['min_plays'] == 0
 
 
 def test_centering_with_variable_play_lengths_removes_length_and_offset_drift():
@@ -188,22 +201,6 @@ def test_centering_with_variable_play_lengths_removes_length_and_offset_drift():
     assert not np.allclose(raw, np.where(valid, shifted, 0).sum(1) / nf)
 
 
-def test_shrinkage_floor_keeps_two_game_player_from_topping_the_ranking():
-    rng = np.random.default_rng(4)
-    rows = [pd.DataFrame({'nfl_id': i, 'game_id': np.arange(60) % 15, 'x': rng.normal(0.1 * rng.normal(), 1, 60)})
-            for i in range(50)]
-    rows.append(pd.DataFrame({'nfl_id': 99, 'game_id': [0, 1], 'x': [1.5, 1.52]}))
-    plays = pd.concat(rows, ignore_index=True)
-    n = plays.groupby('nfl_id').size()
-    mean = plays.groupby('nfl_id').x.mean()
-    group = pd.Series('WR', index=mean.index)
-    se = clustered_se(plays, 'x')
-    unfloored = shrink(mean, se, group, n)
-    floored = shrink(mean, se, group, n, pooled_play_var(plays, 'x', group))
-    assert unfloored.idxmax() == 99
-    assert floored.idxmax() != 99 and floored[99] < 0.7
-
-
 def test_score_fold_pads_batches_to_the_cache_width(monkeypatch):
     torch.manual_seed(0)
     cfg = ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, obs_frames=2, d_model=32, n_heads=2,
@@ -221,6 +218,7 @@ def test_score_fold_pads_batches_to_the_cache_width(monkeypatch):
         play_id = np.arange(n)
         nfl_id = np.tile(np.arange(N_ENT), (n, 1))
         meta = {'coverage_vocab': list('abcd')}
+        route_labels = None
 
         def batch(self, idx):
             from ghost.data import PlayData
