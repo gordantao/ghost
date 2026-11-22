@@ -1,8 +1,22 @@
 import pytest
 import torch
 
-from ghost.model import ModelConfig, elbo_loss, sample_ade
+from ghost.model import GhostDefense, ModelConfig, elbo_loss, sample_ade
 from ghost.preprocess import DEF, OFF
+
+
+def _model(lookahead, layers=1):
+    torch.manual_seed(0)
+    cfg = ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, obs_frames=2, d_model=32, n_heads=2,
+                      n_enc_layers=layers, n_post_layers=1, n_dec_layers=layers, d_latent=4, dropout=0.0,
+                      lookahead=lookahead)
+    return GhostDefense(cfg).eval()
+
+
+@pytest.fixture(params=[-1, 0, 2], ids=lambda la: f'lookahead={la}')
+def model(request):
+    """Every invariant below must hold for the bidirectional and the causal ghost."""
+    return _model(request.param)
 
 
 def test_shapes_and_backward(model, batch):
@@ -130,3 +144,34 @@ def test_return_coverage_reports_the_drawn_calls(model, batch):
         assert torch.allclose(samples[:, j], fixed[:, j], atol=1e-5)
     _, fixed_call = model.sample(batch, k=4, coverage=batch['coverage'], return_coverage=True)
     assert torch.equal(fixed_call, batch['coverage'][:, None].expand(-1, 4))
+
+
+@pytest.mark.parametrize('lookahead,layers', [(0, 1), (2, 1), (2, 3)])
+def test_causal_ghost_never_sees_offense_beyond_lookahead(batch, lookahead, layers):
+    """Frame t's ghost defense can't depend on offense or ball after t + lookahead (encoder, z prior,
+    decoder), however many layers are stacked."""
+    model, t0 = _model(lookahead, layers), 6
+    base = _sample(model, batch)
+    changed = {**batch, 'dyn': batch['dyn'].clone()}
+    changed['dyn'][:, t0:] += 7.0
+    after = _sample(model, changed)
+    keep = t0 - lookahead
+    assert torch.allclose(base[:, :, :keep], after[:, :, :keep], atol=1e-5)
+    assert not torch.allclose(base[:, :, keep:], after[:, :, keep:], atol=1e-5)
+
+
+def test_unrestricted_ghost_sees_future_offense(batch):
+    """The default (lookahead=-1) model reads the whole play, so the test above is a real constraint."""
+    model = _model(-1)
+    base = _sample(model, batch)
+    changed = {**batch, 'dyn': batch['dyn'].clone()}
+    changed['dyn'][:, 6:] += 7.0
+    assert not torch.allclose(base[:, :, :6], _sample(model, changed)[:, :, :6], atol=1e-5)
+
+
+def test_lookahead_adds_no_parameters():
+    """Old checkpoints (no `lookahead` in their config) load as lookahead=-1 with the same state dict."""
+    assert _model(-1).state_dict().keys() == _model(0).state_dict().keys()
+    assert ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20).lookahead == -1
+    with pytest.raises(ValueError):
+        ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, lookahead=-2)

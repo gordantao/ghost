@@ -17,6 +17,12 @@ teacher-forced with it and the prior's classifier is trained by cross-entropy;
 the posterior q(z | context, true defense, c) is used only in training. At
 sampling time c is drawn from the prior unless a call is given explicitly, so
 the real call never reaches the ghost by default.
+
+With `lookahead` >= 0 the ghost is causal in the offense: the encoder and
+decoder's temporal attention at frame t sees only frames <= t + lookahead, and
+p(z | context, c) uses the same snap-only context as p(c | context). Ghost
+defenders then react to routes as they unfold instead of knowing where every
+route goes. The posterior (training only) still sees the whole play.
 """
 from __future__ import annotations
 
@@ -47,11 +53,14 @@ class ModelConfig:
     n_dec_layers: int = 2
     d_latent: int = 32
     dropout: float = 0.1
+    lookahead: int = -1  # future frames each frame may attend to; -1 is unrestricted, 0 strictly causal
 
     def __post_init__(self):
         # obs_frames=0 would anchor predictions on real defense from the last frame.
         if not 1 <= self.obs_frames < self.max_frames:
             raise ValueError(f'obs_frames must be in [1, max_frames={self.max_frames}), got {self.obs_frames}')
+        if self.lookahead < -1:
+            raise ValueError(f'lookahead must be -1 (unrestricted) or >= 0, got {self.lookahead}')
 
 
 class FactorizedBlock(nn.Module):
@@ -64,10 +73,12 @@ class FactorizedBlock(nn.Module):
         self.temporal = layer()
         self.social = layer()
 
-    def forward(self, x: torch.Tensor, time_pad: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_pad: torch.Tensor,
+                time_attn: torch.Tensor | None = None) -> torch.Tensor:
+        """time_attn: optional [T, T] bool, True where frame t may not attend to frame s."""
         B, T, N, D = x.shape
         x = x.transpose(1, 2).reshape(B * N, T, D)
-        x = self.temporal(x, src_key_padding_mask=time_pad.repeat_interleave(N, dim=0))
+        x = self.temporal(x, src_mask=time_attn, src_key_padding_mask=time_pad.repeat_interleave(N, dim=0))
         x = x.reshape(B, N, T, D).transpose(1, 2).reshape(B * T, N, D)
         return self.social(x).reshape(B, T, N, D)
 
@@ -124,10 +135,21 @@ class GhostDefense(nn.Module):
             tok = tok + hidden[None, :, :, None] * self.hidden_emb
         return tok + self.dyn_in(x)
 
+    def time_attn(self, T: int, device) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """[T, T] masks, True where frame t may not see frame s, for (the encoder's first layer, every
+        later layer); (None, None) if unrestricted. Look-ahead is granted once, in the first layer, and
+        every later layer is strictly causal, so stacking layers can't extend it past `lookahead`."""
+        if self.cfg.lookahead < 0:
+            return None, None
+        t = torch.arange(T, device=device)
+        return t[None, :] > t[:, None] + self.cfg.lookahead, t[None, :] > t[:, None]
+
     @staticmethod
-    def run(blocks: nn.ModuleList, x: torch.Tensor, time_pad: torch.Tensor) -> torch.Tensor:
-        for block in blocks:
-            x = block(x, time_pad)
+    def run(blocks: nn.ModuleList, x: torch.Tensor, time_pad: torch.Tensor,
+            time_attn: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)) -> torch.Tensor:
+        first, rest = time_attn
+        for i, block in enumerate(blocks):
+            x = block(x, time_pad, rest if i else first)
         return x
 
     @staticmethod
@@ -141,15 +163,21 @@ class GhostDefense(nn.Module):
         The call logits come from a separate pass over only the first `obs_frames`
         frames. Later offense movement reacts to the coverage (hot routes, sight
         adjustments, quick throws), so letting p(c | context) see it would let
-        the ghost read the real call back off the offense.
+        the ghost read the real call back off the offense. With `lookahead` >= 0
+        the pooled context is that snap-only pass too, so z can't carry the
+        routes either.
         """
-        h = self.run(self.encoder, self.embed(batch, hide_defense=True), ~batch['time_mask'])
-        ctx = self.pool(h, batch['time_mask'])
+        T = batch['dyn'].shape[1]
+        h = self.run(self.encoder, self.embed(batch, hide_defense=True), ~batch['time_mask'],
+                     self.time_attn(T, batch['dyn'].device))
         n = self.cfg.obs_frames
         snap = {key: batch[key][:, :n] for key in ('dyn', 'time_mask')}
         snap.update(group=batch['group'], glob=batch['glob'])
-        h_snap = self.run(self.encoder, self.embed(snap, hide_defense=True), ~snap['time_mask'])
-        return h, ctx, self.coverage_head(self.pool(h_snap, snap['time_mask']))
+        h_snap = self.run(self.encoder, self.embed(snap, hide_defense=True), ~snap['time_mask'],
+                          self.time_attn(n, batch['dyn'].device))
+        snap_ctx = self.pool(h_snap, snap['time_mask'])
+        ctx = snap_ctx if self.cfg.lookahead >= 0 else self.pool(h, batch['time_mask'])
+        return h, ctx, self.coverage_head(snap_ctx)
 
     def prior(self, ctx: torch.Tensor, coverage: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """p(z | context, c)."""
@@ -164,7 +192,8 @@ class GhostDefense(nn.Module):
     def decode(self, h: torch.Tensor, z: torch.Tensor, coverage: torch.Tensor, batch: dict) -> torch.Tensor:
         """Defender positions [B, T, 11, 2] in yards, as offsets from the last observed frame."""
         x = h + (self.latent_in(z) + self.coverage_emb(coverage))[:, None, None]
-        x = self.run(self.decoder, x, ~batch['time_mask'])
+        causal = self.time_attn(x.shape[1], x.device)[1]
+        x = self.run(self.decoder, x, ~batch['time_mask'], (causal, causal))
         anchor = batch['dyn'][:, self.cfg.obs_frames - 1, DEF, :2]
         return anchor[:, None] + POS_SCALE * self.out(x[:, :, DEF])
 
