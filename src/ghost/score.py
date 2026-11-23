@@ -39,6 +39,7 @@ comes from a model that trained on that play.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -53,9 +54,24 @@ from .train import load_model, pick_device
 
 RECEIVER_IDS = [GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS]
 H_COLS = ('H', 'H_within', 'H_call')
-# Defender-density bandwidths in yards: 2 counts tight coverage only, 5 also reaches help defenders.
+# Default defender-density bandwidths in yards: 2 counts tight coverage only, 5 also reaches
+# help defenders. `score --density-sigmas` picks others (e.g. a grid for tuning).
 DENSITY_SIGMAS = (2, 5)
-DENS_COLS = tuple(f'H_dens{s}' for s in DENSITY_SIGMAS)
+
+
+def dens_col(sigma: float) -> str:
+    """The H_dens column for one bandwidth: 2 -> 'H_dens2', 2.5 -> 'H_dens2.5'."""
+    return f'H_dens{sigma:g}'
+
+
+DENS_COLS = tuple(dens_col(s) for s in DENSITY_SIGMAS)
+_DENS_RE = re.compile(r'^H_dens[\d.]+$')
+
+
+def dens_cols_in(names) -> list[str]:
+    """The H_dens{sigma} names among `names` (column names, or array keys with a `_t` suffix)."""
+    names = [n[:-2] if n.endswith('_t') else n for n in names]
+    return [n for n in names if _DENS_RE.match(n)]
 # A centering cell (fold, group, frame offset) needs at least this many scored rows.
 # Offsets from the first one with fewer rows onward share one pooled cell, so the
 # long tail of rarely-reached late frames doesn't get noisy means.
@@ -197,14 +213,14 @@ def frame_arrays(batch: dict, h_t: torch.Tensor, obs_frames: int, width: int) ->
 
 
 def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
-               device: torch.device) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+               device: torch.device, density_sigmas=DENSITY_SIGMAS) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
     """Per-(play, receiver) rows, and the per-frame arrays `H_t`, `H_within_t`, `H_dens{sigma}_t` and
     `valid` ([N, T], same row order). Density uses the total ghost (own call) only."""
     model, ckpt = load_model(ckpt_path, device)
     obs = model.cfg.obs_frames
     width = data.dyn.shape[1]
     frames, valids = [], []
-    per_frame = {k: [] for k in ('H_t', 'H_within_t', *(f'{c}_t' for c in DENS_COLS))}
+    per_frame = {k: [] for k in ('H_t', 'H_within_t', *(f'{dens_col(s)}_t' for s in density_sigmas))}
     for idx, batch, seed in fold_batches(ckpt, data, held_out_plays(ckpt, data), batch_size, device):
         total_samples, within_samples = two_ghosts(model, batch, n_samples, seed)
         total, within = heliocentricity(total_samples, batch, obs), heliocentricity(within_samples, batch, obs)
@@ -215,11 +231,11 @@ def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
         h, valid = frame_arrays(batch, total['H_t'], obs, width)
         per_frame['H_t'].append(h)
         per_frame['H_within_t'].append(frame_arrays(batch, within['H_t'], obs, width)[0])
-        for sigma, c in zip(DENSITY_SIGMAS, DENS_COLS):
-            dens = density_gravity(total_samples, batch, obs, sigma)
+        for sigma in density_sigmas:
+            dens, c = density_gravity(total_samples, batch, obs, sigma), dens_col(sigma)
             cols[c] = dens['H'].cpu().numpy()
-            cols[f'dens{sigma}_expected'] = dens['expected'].cpu().numpy()
-            cols[f'dens{sigma}_actual'] = dens['actual'].cpu().numpy()
+            cols[f'dens{sigma:g}_expected'] = dens['expected'].cpu().numpy()
+            cols[f'dens{sigma:g}_actual'] = dens['actual'].cpu().numpy()
             per_frame[f'{c}_t'].append(frame_arrays(batch, dens['H_t'], obs, width)[0])
         frames.append(receiver_rows(data, idx, batch, cols))
         valids.append(valid)
@@ -268,7 +284,7 @@ def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: n
 def add_centered(plays: pd.DataFrame, arrays: dict[str, np.ndarray], min_rows: int = MIN_CELL_ROWS) -> pd.DataFrame:
     """Add H_centered, H_within_centered and H_call_centered (and H_dens{sigma}_centered for each
     density array present) to the play-receiver rows."""
-    for col in ('H', 'H_within', *DENS_COLS):
+    for col in ('H', 'H_within', *dens_cols_in(arrays)):
         if f'{col}_t' in arrays:
             plays[f'{col}_centered'] = center_frames(arrays[f'{col}_t'], arrays['valid'], plays.fold.to_numpy(),
                                                      plays.group.to_numpy(), min_rows)
@@ -323,12 +339,13 @@ def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None,
     )
     for h in H_COLS:
         stats[f'{h}_se'] = stats[f'{h}_std'] / np.sqrt(stats.n_plays)
-    for h in (c for c in DENS_COLS if c in plays):
+    dens = dens_cols_in(plays.columns)
+    for h in dens:
         stats[f'{h}_mean'] = plays.groupby('nfl_id')[h].mean()
         stats[f'{h}_se'] = plays.groupby('nfl_id')[h].std() / np.sqrt(stats.n_plays)
     centered = [f'{h}_centered' for h in H_COLS]
     if all(c in plays for c in centered) and 'game_id' in plays:
-        centered += [f'{h}_centered' for h in DENS_COLS if f'{h}_centered' in plays]
+        centered += [f'{h}_centered' for h in dens if f'{h}_centered' in plays]
         for c in centered:
             stats[f'{c}_mean'] = plays.groupby('nfl_id')[c].mean()
             stats[f'{c}_se'] = clustered_se(plays, c)
@@ -398,9 +415,10 @@ def load_cross_fit(data_path: Path | None, runs_dir: Path,
 
 def score(data_path: Path | None, runs_dir: Path, out_dir: Path, n_samples: int = 16,
           batch_size: int = 32, players_csvs: list[Path] | None = None, device: str = 'auto',
-          include_blockers: bool = False, min_plays: int | None = None) -> None:
+          include_blockers: bool = False, min_plays: int | None = None,
+          density_sigmas=DENSITY_SIGMAS) -> None:
     ckpts, data, dev = load_cross_fit(data_path, runs_dir, device)
-    folds = [score_fold(c, data, n_samples, batch_size, dev) for c in ckpts]
+    folds = [score_fold(c, data, n_samples, batch_size, dev, density_sigmas) for c in ckpts]
     plays = pd.concat([f for f, _ in folds], ignore_index=True)
     arrays = {k: np.concatenate([a[k] for _, a in folds]) for k in folds[0][1]}
     del folds

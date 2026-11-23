@@ -62,6 +62,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--min-plays', type=int, default=None,
                    help='leave players with fewer aggregated plays out of player_scores.csv '
                         '(default: the lower quartile of players by play count)')
+    p.add_argument('--density-sigmas', type=float, nargs='+', default=[2, 5],
+                   help='defender-density bandwidths in yards; one H_dens{sigma} column each')
     p.add_argument('--device', default='auto')
 
     p = sub.add_parser('sample-size', help='how many ghost samples score needs (per-play Monte Carlo error)')
@@ -111,7 +113,8 @@ def main(argv: list[str] | None = None) -> None:
         from .score import score
         score(args.data, args.runs, args.out or args.runs / 'scores', args.samples,
               args.batch_size, args.players or DEFAULT_PLAYERS, args.device,
-              include_blockers=args.include_blockers, min_plays=args.min_plays)
+              include_blockers=args.include_blockers, min_plays=args.min_plays,
+              density_sigmas=args.density_sigmas)
     elif args.command == 'sample-size':
         from .sample_size import sample_size
         sample_size(args.data, args.runs, args.out or args.runs / 'sample_size', args.samples, args.batch_size,

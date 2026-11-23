@@ -7,7 +7,7 @@ import torch
 
 from ghost.model import GhostDefense, ModelConfig, future_mask
 from ghost.preprocess import DEF, GROUP_VOCAB, N_ENT
-from ghost.score import (DENS_COLS, add_centered, aggregate_players, center_frames, check_checkpoints, clustered_se,
+from ghost.score import (DENS_COLS, add_centered, dens_col, aggregate_players, center_frames, check_checkpoints, clustered_se,
                          defender_density, density_gravity, heliocentricity, lower_quartile_plays, offset_buckets, player_names, score_fold)
 import ghost.score as score_mod
 
@@ -254,7 +254,8 @@ def test_density_gravity_is_zero_when_ghosts_match_and_positive_when_they_are_lo
     assert torch.allclose((far['H_t'] * mask).sum(1) / mask.sum(1), far['H'], atol=1e-5)
 
 
-def test_density_columns_are_centered_and_aggregated_when_present():
+@pytest.mark.parametrize('cols', [DENS_COLS, (dens_col(1), dens_col(2.5), dens_col(10))])
+def test_density_columns_are_centered_and_aggregated_when_present(cols):
     rng = np.random.default_rng(5)
     n, T = 300, 10
     valid = np.ones((n, T), bool)
@@ -262,12 +263,12 @@ def test_density_columns_are_centered_and_aggregated_when_present():
     plays = pd.DataFrame({'nfl_id': rng.integers(0, 6, n), 'game_id': rng.integers(0, 30, n), 'group': 'WR',
                           'fold': 0, 'ran_route': True, 'H': h_t.mean(1), 'H_within': h_t.mean(1),
                           'H_call': 0.0, 'expected_sep': 4.0, 'expected_sep_within': 4.0, 'actual_sep': 4.0})
-    for c in DENS_COLS:
+    for c in cols:
         plays[c] = h_t.mean(1) * 0.1
-    arrays = {'H_t': h_t, 'H_within_t': h_t, 'valid': valid, **{f'{c}_t': h_t * 0.1 for c in DENS_COLS}}
+    arrays = {'H_t': h_t, 'H_within_t': h_t, 'valid': valid, **{f'{c}_t': h_t * 0.1 for c in cols}}
     add_centered(plays, arrays, min_rows=1)
     stats = aggregate_players(plays, None)
-    for c in DENS_COLS:
+    for c in cols:
         assert abs(plays[f'{c}_centered'].mean()) < 1e-9
         for suffix in ('_mean', '_se', '_centered_mean', '_centered_se'):
             assert f'{c}{suffix}' in stats
