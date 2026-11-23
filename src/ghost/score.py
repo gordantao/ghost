@@ -18,6 +18,15 @@ the play's frames, so what is left is gravity relative to the group's norm.
 Player scores then get game-clustered standard errors, and players with too
 few plays to rank (by default the lower quartile by play count) are left out.
 
+H_dens{sigma} is the same comparison for defender density instead of
+nearest distance: every defender counts exp(-d^2 / 2 sigma^2), and H_dens is the
+real density minus the mean ghost density. Far defenders add almost nothing and
+a second close defender counts as much as the first, so it credits double
+coverage and (at the wider bandwidth) help, and isn't dominated by how far away
+the nearest defender is on loose plays. Positive still means the real defense
+crowded the player more than the ghosts did. It is unitless (about "defenders
+within sigma yards"), so it isn't comparable to H in size.
+
 Two ghosts are scored. For H the ghost draws its coverage call from the model's
 prior, so H is total gravity, including any that shows up in the call itself.
 For H_within the ghost runs the defense's actual call, so H_within is gravity
@@ -44,6 +53,9 @@ from .train import load_model, pick_device
 
 RECEIVER_IDS = [GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS]
 H_COLS = ('H', 'H_within', 'H_call')
+# Defender-density bandwidths in yards: 2 counts tight coverage only, 5 also reaches help defenders.
+DENSITY_SIGMAS = (2, 5)
+DENS_COLS = tuple(f'H_dens{s}' for s in DENSITY_SIGMAS)
 # A centering cell (fold, group, frame offset) needs at least this many scored rows.
 # Offsets from the first one with fewer rows onward share one pooled cell, so the
 # long tail of rarely-reached late frames doesn't get noisy means.
@@ -53,6 +65,12 @@ MIN_CELL_ROWS = 200
 def nearest_defender_distance(receivers: torch.Tensor, defenders: torch.Tensor) -> torch.Tensor:
     """receivers [..., T, R, 2], defenders [..., T, D, 2] -> [..., T, R]."""
     return (receivers[..., :, None, :] - defenders[..., None, :, :]).norm(dim=-1).min(dim=-1).values
+
+
+def defender_density(receivers: torch.Tensor, defenders: torch.Tensor, sigma: float) -> torch.Tensor:
+    """receivers [..., T, R, 2], defenders [..., T, D, 2] -> [..., T, R]: sum over defenders of exp(-d^2 / 2 sigma^2)."""
+    d2 = (receivers[..., :, None, :] - defenders[..., None, :, :]).pow(2).sum(-1)
+    return torch.exp(-d2 / (2 * sigma ** 2)).sum(-1)
 
 
 @torch.no_grad()
@@ -91,6 +109,18 @@ def heliocentricity(samples: torch.Tensor, batch: dict, obs_frames: int) -> dict
         'H_t': ghost_dist.mean(1) - actual_dist,
         'n_frames': n.expand_as(actual_sep),
     }
+
+
+@torch.no_grad()
+def density_gravity(samples: torch.Tensor, batch: dict, obs_frames: int, sigma: float) -> dict[str, torch.Tensor]:
+    """Density analogue of `heliocentricity`: [B, 11] expected and actual defender density, and
+    H = actual - expected; `H_t` [B, T, 11] per frame."""
+    offense = batch['dyn'][:, :, OFF, :2]
+    ghost = defender_density(offense[:, None], samples, sigma).mean(1)                 # [B, T, 11]
+    actual = defender_density(offense, batch['dyn'][:, :, DEF, :2], sigma)            # [B, T, 11]
+    expected = masked_frame_mean(ghost[:, None], batch, obs_frames)[:, 0]
+    real = masked_frame_mean(actual[:, None], batch, obs_frames)[:, 0]
+    return {'expected': expected, 'actual': real, 'H': real - expected, 'H_t': actual - ghost}
 
 
 def actual_separation(batch: dict, obs_frames: int) -> torch.Tensor:
@@ -168,26 +198,34 @@ def frame_arrays(batch: dict, h_t: torch.Tensor, obs_frames: int, width: int) ->
 
 def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
                device: torch.device) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
-    """Per-(play, receiver) rows, and the per-frame arrays `H_t`, `H_within_t`, `valid` ([N, T], same row order)."""
+    """Per-(play, receiver) rows, and the per-frame arrays `H_t`, `H_within_t`, `H_dens{sigma}_t` and
+    `valid` ([N, T], same row order). Density uses the total ghost (own call) only."""
     model, ckpt = load_model(ckpt_path, device)
     obs = model.cfg.obs_frames
     width = data.dyn.shape[1]
-    frames, h_ts, hw_ts, valids = [], [], [], []
+    frames, valids = [], []
+    per_frame = {k: [] for k in ('H_t', 'H_within_t', *(f'{c}_t' for c in DENS_COLS))}
     for idx, batch, seed in fold_batches(ckpt, data, held_out_plays(ckpt, data), batch_size, device):
-        total, within = (heliocentricity(s, batch, obs) for s in two_ghosts(model, batch, n_samples, seed))
+        total_samples, within_samples = two_ghosts(model, batch, n_samples, seed)
+        total, within = heliocentricity(total_samples, batch, obs), heliocentricity(within_samples, batch, obs)
         cols = {k: v.cpu().numpy() for k, v in total.items() if k != 'H_t'}
         cols['expected_sep_within'] = within['expected_sep'].cpu().numpy()
         cols['H_within'] = within['H'].cpu().numpy()
         cols['H_call'] = cols['H'] - cols['H_within']
-        frames.append(receiver_rows(data, idx, batch, cols))
         h, valid = frame_arrays(batch, total['H_t'], obs, width)
-        h_ts.append(h)
-        hw_ts.append(frame_arrays(batch, within['H_t'], obs, width)[0])
+        per_frame['H_t'].append(h)
+        per_frame['H_within_t'].append(frame_arrays(batch, within['H_t'], obs, width)[0])
+        for sigma, c in zip(DENSITY_SIGMAS, DENS_COLS):
+            dens = density_gravity(total_samples, batch, obs, sigma)
+            cols[c] = dens['H'].cpu().numpy()
+            cols[f'dens{sigma}_expected'] = dens['expected'].cpu().numpy()
+            cols[f'dens{sigma}_actual'] = dens['actual'].cpu().numpy()
+            per_frame[f'{c}_t'].append(frame_arrays(batch, dens['H_t'], obs, width)[0])
+        frames.append(receiver_rows(data, idx, batch, cols))
         valids.append(valid)
     out = pd.concat(frames, ignore_index=True)
     out['fold'] = ckpt['fold']
-    return out, {'H_t': np.concatenate(h_ts), 'H_within_t': np.concatenate(hw_ts),
-                 'valid': np.concatenate(valids)}
+    return out, {**{k: np.concatenate(v) for k, v in per_frame.items()}, 'valid': np.concatenate(valids)}
 
 
 def offset_buckets(valid: np.ndarray, min_rows: int) -> np.ndarray:
@@ -228,10 +266,12 @@ def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: n
 
 
 def add_centered(plays: pd.DataFrame, arrays: dict[str, np.ndarray], min_rows: int = MIN_CELL_ROWS) -> pd.DataFrame:
-    """Add H_centered, H_within_centered and H_call_centered to the play-receiver rows."""
-    for name, key in (('H_centered', 'H_t'), ('H_within_centered', 'H_within_t')):
-        plays[name] = center_frames(arrays[key], arrays['valid'], plays.fold.to_numpy(),
-                                    plays.group.to_numpy(), min_rows)
+    """Add H_centered, H_within_centered and H_call_centered (and H_dens{sigma}_centered for each
+    density array present) to the play-receiver rows."""
+    for col in ('H', 'H_within', *DENS_COLS):
+        if f'{col}_t' in arrays:
+            plays[f'{col}_centered'] = center_frames(arrays[f'{col}_t'], arrays['valid'], plays.fold.to_numpy(),
+                                                     plays.group.to_numpy(), min_rows)
     plays['H_call_centered'] = plays.H_centered - plays.H_within_centered
     return plays
 
@@ -283,8 +323,12 @@ def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None,
     )
     for h in H_COLS:
         stats[f'{h}_se'] = stats[f'{h}_std'] / np.sqrt(stats.n_plays)
+    for h in (c for c in DENS_COLS if c in plays):
+        stats[f'{h}_mean'] = plays.groupby('nfl_id')[h].mean()
+        stats[f'{h}_se'] = plays.groupby('nfl_id')[h].std() / np.sqrt(stats.n_plays)
     centered = [f'{h}_centered' for h in H_COLS]
     if all(c in plays for c in centered) and 'game_id' in plays:
+        centered += [f'{h}_centered' for h in DENS_COLS if f'{h}_centered' in plays]
         for c in centered:
             stats[f'{c}_mean'] = plays.groupby('nfl_id')[c].mean()
             stats[f'{c}_se'] = clustered_se(plays, c)

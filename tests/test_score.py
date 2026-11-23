@@ -5,10 +5,10 @@ import pandas as pd
 import pytest
 import torch
 
-from ghost.model import GhostDefense, ModelConfig
+from ghost.model import GhostDefense, ModelConfig, future_mask
 from ghost.preprocess import DEF, GROUP_VOCAB, N_ENT
-from ghost.score import (add_centered, aggregate_players, center_frames, check_checkpoints, clustered_se,
-                         heliocentricity, lower_quartile_plays, offset_buckets, player_names, score_fold)
+from ghost.score import (DENS_COLS, add_centered, aggregate_players, center_frames, check_checkpoints, clustered_se,
+                         defender_density, density_gravity, heliocentricity, lower_quartile_plays, offset_buckets, player_names, score_fold)
 import ghost.score as score_mod
 
 
@@ -230,3 +230,44 @@ def test_score_fold_pads_batches_to_the_cache_width(monkeypatch):
     rows, arrays = score_fold(None, Stub(), 2, 8, torch.device('cpu'))
     assert arrays['H_t'].shape == arrays['valid'].shape == (len(rows), 20)
     assert np.isfinite(arrays['H_t']).all() and not arrays['valid'][:, :2].any()
+    for c in DENS_COLS:
+        assert arrays[f'{c}_t'].shape == (len(rows), 20) and np.isfinite(arrays[f'{c}_t']).all()
+        assert c in rows and rows[c].notna().all()
+
+
+def test_defender_density_counts_every_close_defender():
+    rec = torch.zeros(1, 1, 2)
+    one = torch.tensor([[[2.0, 0.0], [50.0, 0.0]]])
+    two = torch.tensor([[[2.0, 0.0], [0.0, 2.0]]])
+    expected = torch.exp(torch.tensor(-4.0 / 8.0))                 # d = 2, sigma = 2
+    assert torch.allclose(defender_density(rec, one, 2.0), expected, atol=1e-6)   # the far defender adds ~0
+    assert torch.allclose(defender_density(rec, two, 2.0), 2 * expected)          # double coverage counts twice
+
+
+def test_density_gravity_is_zero_when_ghosts_match_and_positive_when_they_are_looser(batch):
+    actual = batch['dyn'][:, :, DEF, :2]
+    same = density_gravity(actual[:, None].expand(-1, 3, -1, -1, -1), batch, 1, 2.0)
+    assert torch.allclose(same['H'], torch.zeros_like(same['H']), atol=1e-5)
+    far = density_gravity(actual[:, None].expand(-1, 3, -1, -1, -1) + 100.0, batch, 1, 2.0)
+    assert (far['H'] >= 0).all() and (far['H'] > 0).any()
+    mask = future_mask(batch['time_mask'], 1)[:, :, None].float()
+    assert torch.allclose((far['H_t'] * mask).sum(1) / mask.sum(1), far['H'], atol=1e-5)
+
+
+def test_density_columns_are_centered_and_aggregated_when_present():
+    rng = np.random.default_rng(5)
+    n, T = 300, 10
+    valid = np.ones((n, T), bool)
+    h_t = rng.normal(0.5, 1, (n, T))
+    plays = pd.DataFrame({'nfl_id': rng.integers(0, 6, n), 'game_id': rng.integers(0, 30, n), 'group': 'WR',
+                          'fold': 0, 'ran_route': True, 'H': h_t.mean(1), 'H_within': h_t.mean(1),
+                          'H_call': 0.0, 'expected_sep': 4.0, 'expected_sep_within': 4.0, 'actual_sep': 4.0})
+    for c in DENS_COLS:
+        plays[c] = h_t.mean(1) * 0.1
+    arrays = {'H_t': h_t, 'H_within_t': h_t, 'valid': valid, **{f'{c}_t': h_t * 0.1 for c in DENS_COLS}}
+    add_centered(plays, arrays, min_rows=1)
+    stats = aggregate_players(plays, None)
+    for c in DENS_COLS:
+        assert abs(plays[f'{c}_centered'].mean()) < 1e-9
+        for suffix in ('_mean', '_se', '_centered_mean', '_centered_se'):
+            assert f'{c}{suffix}' in stats
