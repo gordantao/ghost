@@ -62,8 +62,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument('--min-plays', type=int, default=None,
                    help='leave players with fewer aggregated plays out of player_scores.csv '
                         '(default: the lower quartile of players by play count)')
-    p.add_argument('--density-sigmas', type=float, nargs='+', default=[2, 5],
-                   help='defender-density bandwidths in yards; one H_dens{sigma} column each')
+    p.add_argument('--density-sigmas', type=float, nargs='+', default=[1, 8],
+                   help='defender-density bandwidths in yards; one H_dens{sigma} column each '
+                        '(player_scores.csv is sorted by H_dens8 when 8 is among them)')
     p.add_argument('--device', default='auto')
 
     p = sub.add_parser('sample-size', help='how many ghost samples score needs (per-play Monte Carlo error)')

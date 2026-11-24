@@ -7,7 +7,7 @@ import torch
 
 from ghost.model import GhostDefense, ModelConfig, future_mask
 from ghost.preprocess import DEF, GROUP_VOCAB, N_ENT
-from ghost.score import (DENS_COLS, add_centered, dens_col, aggregate_players, center_frames, check_checkpoints, clustered_se,
+from ghost.score import (DENS_COLS, MAIN_SIGMA, add_centered, dens_col, snap_alignment, aggregate_players, center_frames, check_checkpoints, clustered_se,
                          defender_density, density_gravity, heliocentricity, lower_quartile_plays, offset_buckets, player_names, score_fold)
 import ghost.score as score_mod
 
@@ -233,6 +233,7 @@ def test_score_fold_pads_batches_to_the_cache_width(monkeypatch):
     for c in DENS_COLS:
         assert arrays[f'{c}_t'].shape == (len(rows), 20) and np.isfinite(arrays[f'{c}_t']).all()
         assert c in rows and rows[c].notna().all()
+    assert set(rows['align']) <= {'backfield', 'tight', 'slot', 'wide'}
 
 
 def test_defender_density_counts_every_close_defender():
@@ -272,3 +273,41 @@ def test_density_columns_are_centered_and_aggregated_when_present(cols):
         assert abs(plays[f'{c}_centered'].mean()) < 1e-9
         for suffix in ('_mean', '_se', '_centered_mean', '_centered_se'):
             assert f'{c}{suffix}' in stats
+
+
+def test_snap_alignment_labels_backfield_tight_slot_and_wide():
+    xy = np.zeros((1, N_ENT, 2))
+    group = np.full((1, N_ENT), GROUP_VOCAB.index('OL'))
+    group[0, 11:22] = GROUP_VOCAB.index('DB')
+    place = {0: ('RB', -5, 0), 1: ('RB', -1, 8), 2: ('TE', 0, 3), 3: ('WR', 0, 10), 4: ('WR', 0, 20),
+             5: ('WR', 0, -18)}
+    for j, (g, x, y) in place.items():
+        group[0, j], xy[0, j] = GROUP_VOCAB.index(g), (x, y)
+    xy[0, 22] = (0, 0)
+    align = snap_alignment(xy, group)[0]
+    assert list(align[:6]) == ['backfield', 'slot', 'tight', 'slot', 'wide', 'wide']
+
+
+def test_centering_cells_include_alignment():
+    rng = np.random.default_rng(7)
+    n, T = 400, 6
+    align = rng.choice(['slot', 'wide'], n)
+    h_t = rng.normal(0, 0.1, (n, T)) + (align == 'slot')[:, None] * 0.5        # the ghost is looser on slot receivers
+    plays = pd.DataFrame({'fold': 0, 'group': 'WR', 'align': align})
+    add_centered(plays, {'H_t': h_t, 'H_within_t': h_t, 'valid': np.ones((n, T), bool)}, min_rows=1)
+    for a in ('slot', 'wide'):
+        assert abs(plays.H_centered[plays['align'] == a].mean()) < 1e-9
+
+
+def test_player_scores_sort_by_the_main_density_metric_when_scored():
+    rng = np.random.default_rng(8)
+    n = 200
+    plays = pd.DataFrame({'nfl_id': rng.integers(0, 10, n), 'game_id': rng.integers(0, 40, n), 'group': 'WR',
+                          'ran_route': True, 'expected_sep': 4.0, 'expected_sep_within': 3.5, 'actual_sep': 2.0})
+    main = dens_col(MAIN_SIGMA)
+    for h in ('H', 'H_within', 'H_call', main):
+        plays[h] = rng.normal(0, 1, n)
+        plays[f'{h}_centered'] = plays[h]
+    stats = aggregate_players(plays, None)
+    assert stats[f'{main}_centered_mean'].is_monotonic_decreasing
+    assert not stats.H_centered_mean.is_monotonic_decreasing

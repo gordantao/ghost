@@ -12,9 +12,11 @@ offensive movement; that extra attention is the receiver's "gravity".
 
 Raw H carries the model's miscalibration: for a calibrated ghost the mean H in
 any group defined by model inputs is exactly 0, yet real fold models are biased
-by position group and increasingly so at later frames. H_centered subtracts the
-mean H_t of each (fold, position group, frame offset) cell before averaging over
-the play's frames, so what is left is gravity relative to the group's norm.
+by position group, by alignment at the snap (slot receivers look tighter than
+wide ones) and increasingly so at later frames. H_centered subtracts the mean
+H_t of each (fold, position group, alignment, frame offset) cell before averaging
+over the play's frames, so what is left is gravity relative to players at the
+same position lined up the same way.
 Player scores then get game-clustered standard errors, and players with too
 few plays to rank (by default the lower quartile by play count) are left out.
 
@@ -25,7 +27,9 @@ a second close defender counts as much as the first, so it credits double
 coverage and (at the wider bandwidth) help, and isn't dominated by how far away
 the nearest defender is on loose plays. Positive still means the real defense
 crowded the player more than the ghosts did. It is unitless (about "defenders
-within sigma yards"), so it isn't comparable to H in size.
+within sigma yards"), so it isn't comparable to H in size. H_dens8 is the main
+metric: unlike nearest-distance H it stays reliable across games once alignment
+is accounted for, and it barely depends on play length.
 
 Two ghosts are scored. For H the ghost draws its coverage call from the model's
 prior, so H is total gravity, including any that shows up in the call itself.
@@ -48,15 +52,18 @@ import torch
 
 from .data import PlayData, split_indices
 from .model import future_mask
-from .preprocess import DEF, GROUP_VOCAB, OFF, RECEIVER_GROUPS
+from .preprocess import BALL, DEF, GROUP_VOCAB, OFF, RECEIVER_GROUPS
 from .routes import check_label_coverage, load_route_labels, route_flags, rule_ran_route
 from .train import load_model, pick_device
 
 RECEIVER_IDS = [GROUP_VOCAB.index(g) for g in RECEIVER_GROUPS]
 H_COLS = ('H', 'H_within', 'H_call')
-# Default defender-density bandwidths in yards: 2 counts tight coverage only, 5 also reaches
-# help defenders. `score --density-sigmas` picks others (e.g. a grid for tuning).
-DENSITY_SIGMAS = (2, 5)
+# Default defender-density bandwidths in yards: 1 counts tight coverage only, 8 counts the defenders
+# around the receiver, help included. Chosen from a 1-10 yd grid on split-half and season-to-season
+# reliability after adjusting for alignment, route shape and team (vault: Density bandwidth). 8 is the
+# main metric and sorts player_scores.csv. `score --density-sigmas` picks others.
+DENSITY_SIGMAS = (1, 8)
+MAIN_SIGMA = 8
 
 
 def dens_col(sigma: float) -> str:
@@ -76,6 +83,26 @@ def dens_cols_in(names) -> list[str]:
 # Offsets from the first one with fewer rows onward share one pooled cell, so the
 # long tail of rarely-reached late frames doesn't get noisy means.
 MIN_CELL_ROWS = 200
+
+
+def snap_alignment(xy: np.ndarray, group: np.ndarray) -> np.ndarray:
+    """[B, 11] alignment of each offensive player at the snap: 'backfield', 'tight', 'slot' or 'wide'.
+
+    xy: [B, 23, 2] positions at the snap (x from the ball's x at the snap, so the line is x = 0);
+    group: [B, 23] GROUP_VOCAB ids. Backfield: an RB more than 2 yd behind the line. Tight: within 5 yd
+    of the ball laterally. Slot: another receiver lines up more than 1 yd further outside on his side.
+    Wide: the outermost receiver on his side.
+    """
+    lat = xy[:, OFF, 1] - xy[:, BALL, 1][:, None]                     # [B, 11] signed, from the ball
+    side = np.where(np.abs(lat) > 1, np.sign(lat), 0)
+    rec = np.isin(group[:, OFF], RECEIVER_IDS)
+    # outside[b, j, k]: receiver k is on j's side and more than 1 yd further out
+    outside = (rec[:, None, :] & (side[:, None, :] == side[:, :, None]) & (side[:, :, None] != 0)
+               & (np.abs(lat)[:, None, :] > np.abs(lat)[:, :, None] + 1))
+    out = np.where(outside.any(-1), 'slot', 'wide').astype(object)
+    out[np.abs(lat) < 5] = 'tight'
+    out[(group[:, OFF] == GROUP_VOCAB.index('RB')) & (xy[:, OFF, 0] < -2)] = 'backfield'
+    return out
 
 
 def nearest_defender_distance(receivers: torch.Tensor, defenders: torch.Tensor) -> torch.Tensor:
@@ -228,6 +255,7 @@ def score_fold(ckpt_path: Path, data: PlayData, n_samples: int, batch_size: int,
         cols['expected_sep_within'] = within['expected_sep'].cpu().numpy()
         cols['H_within'] = within['H'].cpu().numpy()
         cols['H_call'] = cols['H'] - cols['H_within']
+        cols['align'] = snap_alignment(batch['dyn'][:, 0, :, :2].cpu().numpy(), batch['group'].cpu().numpy())
         h, valid = frame_arrays(batch, total['H_t'], obs, width)
         per_frame['H_t'].append(h)
         per_frame['H_within_t'].append(frame_arrays(batch, within['H_t'], obs, width)[0])
@@ -283,11 +311,14 @@ def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: n
 
 def add_centered(plays: pd.DataFrame, arrays: dict[str, np.ndarray], min_rows: int = MIN_CELL_ROWS) -> pd.DataFrame:
     """Add H_centered, H_within_centered and H_call_centered (and H_dens{sigma}_centered for each
-    density array present) to the play-receiver rows."""
+    density array present) to the play-receiver rows. Cells are (fold, group, frame offset), and also
+    alignment at the snap when the rows have an `align` column: alignment is a model input, so a
+    calibrated ghost has mean 0 within each alignment too."""
+    cell = (plays.group + '|' + plays['align'] if 'align' in plays else plays.group).to_numpy()
     for col in ('H', 'H_within', *dens_cols_in(arrays)):
         if f'{col}_t' in arrays:
             plays[f'{col}_centered'] = center_frames(arrays[f'{col}_t'], arrays['valid'], plays.fold.to_numpy(),
-                                                     plays.group.to_numpy(), min_rows)
+                                                     cell, min_rows)
     plays['H_call_centered'] = plays.H_centered - plays.H_within_centered
     return plays
 
@@ -326,7 +357,8 @@ def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None,
     """Per-player means. Plays where the receiver didn't run a route (he stayed in to block) are
     left out unless `include_blockers`. Players with fewer than `min_plays` of the remaining plays
     are dropped; None drops the lower quartile of players by play count. The cutoff used is in
-    `.attrs['min_plays']`."""
+    `.attrs['min_plays']`. Sorted by the main metric, H_dens{MAIN_SIGMA}_centered, when it was scored,
+    else by H_centered."""
     if not include_blockers:
         plays = plays[plays.ran_route]
     stats = plays.groupby('nfl_id').agg(
@@ -349,7 +381,8 @@ def aggregate_players(plays: pd.DataFrame, players_csvs: list[Path] | None,
         for c in centered:
             stats[f'{c}_mean'] = plays.groupby('nfl_id')[c].mean()
             stats[f'{c}_se'] = clustered_se(plays, c)
-        sort_by = 'H_centered_mean'
+        main = f'{dens_col(MAIN_SIGMA)}_centered_mean'
+        sort_by = main if main in stats else 'H_centered_mean'
     else:
         sort_by = 'H_mean'
     if min_plays is None:
