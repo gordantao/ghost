@@ -287,12 +287,14 @@ def offset_buckets(valid: np.ndarray, min_rows: int) -> np.ndarray:
 
 
 def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: np.ndarray,
-                  min_rows: int = MIN_CELL_ROWS) -> np.ndarray:
+                  min_rows: int = MIN_CELL_ROWS, reference: np.ndarray | None = None) -> np.ndarray:
     """[N] per-row mean over predicted frames of H_t minus its (fold, group, frame offset) cell mean.
 
     h_t, valid: [N, T]. Late offsets are pooled per `offset_buckets`. Each offset's residuals
     average to 0 over the rows scored there, so a cell's row means are only approximately 0
-    when play lengths vary (zero frame-weighted, not row-weighted).
+    when play lengths vary (zero frame-weighted, not row-weighted). `reference` ([N] bool) limits
+    the rows the cell means come from (every row is still centered); a cell with no reference rows
+    uses all of its rows.
     """
     out = np.zeros(len(h_t))
     n_frames = np.maximum(valid.sum(1), 1)
@@ -300,10 +302,11 @@ def center_frames(h_t: np.ndarray, valid: np.ndarray, fold: np.ndarray, group: n
     for c in np.unique(cell):
         rows = np.flatnonzero(cell == c)
         h, v = h_t[rows], valid[rows]
-        bucket = offset_buckets(v, min_rows)
+        ref = v if reference is None or not reference[rows].any() else v & reference[rows, None]
+        bucket = offset_buckets(ref, min_rows)
         k = bucket.max() + 1
-        total = np.bincount(np.broadcast_to(bucket, h.shape)[v], weights=h[v], minlength=k)
-        count = np.bincount(np.broadcast_to(bucket, h.shape)[v], minlength=k)
+        total = np.bincount(np.broadcast_to(bucket, h.shape)[ref], weights=h[ref], minlength=k)
+        count = np.bincount(np.broadcast_to(bucket, h.shape)[ref], minlength=k)
         mean = np.where(count > 0, total / np.maximum(count, 1), 0.0)
         out[rows] = np.where(v, h - mean[bucket], 0.0).sum(1) / n_frames[rows]
     return out
@@ -313,12 +316,15 @@ def add_centered(plays: pd.DataFrame, arrays: dict[str, np.ndarray], min_rows: i
     """Add H_centered, H_within_centered and H_call_centered (and H_dens{sigma}_centered for each
     density array present) to the play-receiver rows. Cells are (fold, group, frame offset), and also
     alignment at the snap when the rows have an `align` column: alignment is a model input, so a
-    calibrated ghost has mean 0 within each alignment too."""
+    calibrated ghost has mean 0 within each alignment too. Cell means come from route-run plays when
+    the rows have `ran_route`, so the reference is a typical route runner: blocking backs and tight ends
+    have defenders on top of them, and counting them made every route-running RB look less attended."""
     cell = (plays.group + '|' + plays['align'] if 'align' in plays else plays.group).to_numpy()
+    reference = plays.ran_route.to_numpy(bool) if 'ran_route' in plays else None
     for col in ('H', 'H_within', *dens_cols_in(arrays)):
         if f'{col}_t' in arrays:
             plays[f'{col}_centered'] = center_frames(arrays[f'{col}_t'], arrays['valid'], plays.fold.to_numpy(),
-                                                     cell, min_rows)
+                                                     cell, min_rows, reference)
     plays['H_call_centered'] = plays.H_centered - plays.H_within_centered
     return plays
 

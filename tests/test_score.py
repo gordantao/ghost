@@ -311,3 +311,14 @@ def test_player_scores_sort_by_the_main_density_metric_when_scored():
     stats = aggregate_players(plays, None)
     assert stats[f'{main}_centered_mean'].is_monotonic_decreasing
     assert not stats.H_centered_mean.is_monotonic_decreasing
+
+
+def test_centering_cell_means_come_from_route_runners_only():
+    rng = np.random.default_rng(9)
+    n, T = 300, 5
+    blocker = np.arange(n) < 60
+    h_t = rng.normal(0, 0.1, (n, T)) + blocker[:, None] * 2.0      # defenders sit on blockers
+    plays = pd.DataFrame({'fold': 0, 'group': 'RB', 'ran_route': ~blocker})
+    add_centered(plays, {'H_t': h_t, 'H_within_t': h_t, 'valid': np.ones((n, T), bool)}, min_rows=1)
+    assert abs(plays.H_centered[~blocker].mean()) < 1e-9
+    assert plays.H_centered[blocker].mean() > 1.5
