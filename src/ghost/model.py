@@ -54,6 +54,9 @@ class ModelConfig:
     d_latent: int = 32
     dropout: float = 0.1
     lookahead: int = -1  # future frames each frame may attend to; -1 is unrestricted, 0 strictly causal
+    # Baseline without the latents: the decoder sees neither z nor a call, so it makes one prediction per
+    # play, trained on reconstruction (+ the call head's NLL, which doesn't reach the decoder).
+    deterministic: bool = False
 
     def __post_init__(self):
         # obs_frames=0 would anchor predictions on real defense from the last frame.
@@ -189,9 +192,11 @@ class GhostDefense(nn.Module):
         post_ctx = torch.cat([ctx, self.pool(g, batch['time_mask']), self.coverage_emb(batch['coverage'])], -1)
         return self.post_head(post_ctx).chunk(2, dim=-1)
 
-    def decode(self, h: torch.Tensor, z: torch.Tensor, coverage: torch.Tensor, batch: dict) -> torch.Tensor:
-        """Defender positions [B, T, 11, 2] in yards, as offsets from the last observed frame."""
-        x = h + (self.latent_in(z) + self.coverage_emb(coverage))[:, None, None]
+    def decode(self, h: torch.Tensor, z: torch.Tensor | None, coverage: torch.Tensor | None,
+               batch: dict) -> torch.Tensor:
+        """Defender positions [B, T, 11, 2] in yards, as offsets from the last observed frame.
+        The deterministic baseline passes z = coverage = None."""
+        x = h if z is None else h + (self.latent_in(z) + self.coverage_emb(coverage))[:, None, None]
         causal = self.time_attn(x.shape[1], x.device)[1]
         x = self.run(self.decoder, x, ~batch['time_mask'], (causal, causal))
         anchor = batch['dyn'][:, self.cfg.obs_frames - 1, DEF, :2]
@@ -205,6 +210,9 @@ class GhostDefense(nn.Module):
         posterior mean would drop the cost of a wide q from the reconstruction).
         """
         h, ctx, coverage_logits = self.encode(batch)
+        if self.cfg.deterministic:
+            return {'pred': self.decode(h, None, None, batch), 'kl': h.new_zeros(h.shape[0]),
+                    'coverage_logits': coverage_logits}
         mu_p, logvar_p = self.prior(ctx, batch['coverage'])
         mu_q, logvar_q = self.posterior(batch, ctx)
         eps = torch.randn(mu_q.shape, device=mu_q.device, generator=generator)
@@ -226,6 +234,12 @@ class GhostDefense(nn.Module):
         """
         h, ctx, coverage_logits = self.encode(batch)
         B = h.shape[0]
+        if self.cfg.deterministic:
+            # One prediction per play, repeated so callers that average over K see the same shapes.
+            pred = self.decode(h, None, None, batch)
+            pred = pred[:, None].expand(B, k, *pred.shape[1:]).contiguous()
+            c = coverage_logits.argmax(-1)[:, None].expand(B, k)
+            return (pred, c) if return_coverage else pred
         rep = lambda t: t.repeat_interleave(k, dim=0)  # noqa: E731
         eps = torch.randn(B * k, self.cfg.d_latent, device=h.device, generator=generator)
         if coverage is None:

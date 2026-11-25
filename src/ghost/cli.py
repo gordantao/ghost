@@ -18,7 +18,10 @@ def add_dataclass_args(parser: argparse.ArgumentParser, cls, skip=()) -> None:
     for f in fields(cls):
         if f.name in skip:
             continue
-        parser.add_argument(f'--{f.name.replace("_", "-")}', type=type(f.default), default=None,
+        kind = type(f.default)
+        if kind is bool:  # type=bool would read '--flag false' as True
+            kind = lambda v: {'true': True, '1': True, 'false': False, '0': False}[v.lower()]  # noqa: E731
+        parser.add_argument(f'--{f.name.replace("_", "-")}', type=kind, default=None,
                             help=f'default: {f.default}')
 
 

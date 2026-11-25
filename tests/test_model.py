@@ -5,11 +5,11 @@ from ghost.model import GhostDefense, ModelConfig, elbo_loss, sample_ade
 from ghost.preprocess import DEF, OFF
 
 
-def _model(lookahead, layers=1):
+def _model(lookahead, layers=1, deterministic=False):
     torch.manual_seed(0)
     cfg = ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, obs_frames=2, d_model=32, n_heads=2,
                       n_enc_layers=layers, n_post_layers=1, n_dec_layers=layers, d_latent=4, dropout=0.0,
-                      lookahead=lookahead)
+                      lookahead=lookahead, deterministic=deterministic)
     return GhostDefense(cfg).eval()
 
 
@@ -175,3 +175,41 @@ def test_lookahead_adds_no_parameters():
     assert ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20).lookahead == -1
     with pytest.raises(ValueError):
         ModelConfig(n_dyn=7, n_glob=5, n_coverage=4, max_frames=20, lookahead=-2)
+
+
+@pytest.fixture(params=[-1, 0], ids=lambda la: f'deterministic,lookahead={la}')
+def det_model(request):
+    return _model(request.param, deterministic=True)
+
+
+def test_deterministic_baseline_trains_and_repeats_one_prediction(det_model, batch):
+    det_model.train()
+    out = det_model(batch)
+    terms = elbo_loss(out, batch, det_model.cfg.obs_frames, beta=1.0)
+    assert torch.isfinite(terms['loss']) and terms['kl'] == 0
+    terms['loss'].backward()
+    det_model.eval()
+    a = det_model.sample(batch, k=3, generator=torch.Generator().manual_seed(1))
+    b = det_model.sample(batch, k=3, generator=torch.Generator().manual_seed(2))
+    assert a.shape == (3, 3, 12, 11, 2)
+    assert torch.equal(a, b) and torch.equal(a[:, 0], a[:, 2])        # no randomness anywhere
+    assert torch.allclose(a[:, 0], det_model(batch)['pred'], atol=1e-4)   # eval forward = the prediction
+
+
+def test_deterministic_baseline_never_sees_hidden_defense_label_or_padding(det_model, batch):
+    base = _sample(det_model, batch)
+    changed = {**batch, 'dyn': batch['dyn'].clone(), 'coverage': (batch['coverage'] + 1) % det_model.cfg.n_coverage}
+    changed['dyn'][:, det_model.cfg.obs_frames:, DEF] += 7.0
+    changed['dyn'][~batch['time_mask']] = 99.0
+    valid = batch['time_mask'][:, None, :, None, None].expand_as(base)
+    assert torch.allclose(base[valid], _sample(det_model, changed)[valid], atol=1e-5)
+
+
+def test_deterministic_causal_baseline_never_sees_future_offense(batch):
+    model = _model(0, layers=2, deterministic=True)
+    t0 = 6
+    base = _sample(model, batch)
+    changed = {**batch, 'dyn': batch['dyn'].clone()}
+    changed['dyn'][:, t0:, OFF] += 7.0
+    changed['dyn'][:, t0:, 22] += 7.0
+    assert torch.allclose(base[:, :, :t0], _sample(model, changed)[:, :, :t0], atol=1e-5)
