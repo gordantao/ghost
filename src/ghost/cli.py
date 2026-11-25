@@ -59,6 +59,12 @@ def main(argv: list[str] | None = None) -> None:
                    help='players.csv for names; repeatable (default: every release in data/raw)')
     p.add_argument('--include-blockers', action='store_true',
                    help='also aggregate plays where the receiver stayed in to block (default: route runners only)')
+    p.add_argument('--min-plays', type=int, default=None,
+                   help='leave players with fewer aggregated plays out of player_scores.csv '
+                        '(default: the lower quartile of players by play count)')
+    p.add_argument('--density-sigmas', type=float, nargs='+', default=[1, 8],
+                   help='defender-density bandwidths in yards; one H_dens{sigma} column each '
+                        '(player_scores.csv is sorted by H_dens8 when 8 is among them)')
     p.add_argument('--device', default='auto')
 
     p = sub.add_parser('sample-size', help='how many ghost samples score needs (per-play Monte Carlo error)')
@@ -107,7 +113,9 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == 'score':
         from .score import score
         score(args.data, args.runs, args.out or args.runs / 'scores', args.samples,
-              args.batch_size, args.players or DEFAULT_PLAYERS, args.device, include_blockers=args.include_blockers)
+              args.batch_size, args.players or DEFAULT_PLAYERS, args.device,
+              include_blockers=args.include_blockers, min_plays=args.min_plays,
+              density_sigmas=args.density_sigmas)
     elif args.command == 'sample-size':
         from .sample_size import sample_size
         sample_size(args.data, args.runs, args.out or args.runs / 'sample_size', args.samples, args.batch_size,
